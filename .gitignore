@@ -1,0 +1,16 @@
+# Environment and caches
+venv/
+__pycache__/
+*.pyc
+.env
+
+# User Data - EXTREMELY IMPORTANT TO IGNORE
+*.pdf
+*.xlsx
+*.csv
+*.xls
+user_mappings.json
+tx_overrides.json
+
+# OS files
+.DS_Store
