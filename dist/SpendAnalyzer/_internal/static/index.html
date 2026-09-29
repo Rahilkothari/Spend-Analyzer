@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spend Analyzer</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="glass-panel">
+            <h1>Spend Analyzer</h1>
+            <button id="export-btn" class="btn-primary" style="display: none;">Export Excel Report</button>
+        </header>
+
+        <!-- Main Content -->
+        <main>
+            <!-- Upload View -->
+            <section id="upload-view" class="view-section active">
+                <div class="upload-card glass-panel">
+                    <h2>Upload Statements</h2>
+                    <p>Drag and drop your bank statement PDF to generate your dashboard.</p>
+                    
+                    <form id="upload-form">
+                        <div class="file-drop-area" id="bank-drop-area">
+                            <span class="file-msg">Bank Statement (PDF, Excel, CSV) *</span>
+                            <input class="file-input" type="file" id="bank-statement" accept="application/pdf, .xlsx, .xls, .csv" required>
+                        </div>
+                        
+
+                        <div class="input-group">
+                            <label for="context-note">Any context for this period? (Optional)</label>
+                            <input type="text" id="context-note" placeholder="e.g. Moved house, festival month, job change">
+                        </div>
+
+                        <button type="submit" class="btn-primary btn-large">Analyze Spend</button>
+                    </form>
+                </div>
+            </section>
+
+            <!-- Processing View -->
+            <section id="processing-view" class="view-section" style="display: none;">
+                <div class="processing-card glass-panel">
+                    <div class="loader"></div>
+                    <h2 id="processing-text">Reading statement...</h2>
+                    <p>This usually takes 5-15 seconds.</p>
+                </div>
+            </section>
+
+            <!-- Dashboard View -->
+            <section id="dashboard-view" class="view-section" style="display: none;">
+                
+                <!-- Tab Navigation -->
+                <div class="tabs-container glass-panel">
+                    <button class="tab-btn active" data-target="tab-overview">Overview</button>
+                    <button class="tab-btn" data-target="tab-monthly">Monthly Trends</button>
+                    <button class="tab-btn" data-target="tab-category">Category Explorer</button>
+                    <button class="tab-btn" data-target="tab-transactions">Transactions</button>
+                    <button class="tab-btn" data-target="tab-top">Top & Frequent</button>
+                    <button class="tab-btn" data-target="tab-needs">Needs vs Wants</button>
+                </div>
+
+                <!-- TAB: 1. OVERVIEW -->
+                <div id="tab-overview" class="tab-content active">
+                    <!-- Reconciliation Alert -->
+                    <div id="reconciliation-alert" style="display:none; background: rgba(239, 68, 68, 0.2); border-left: 4px solid var(--negative); padding: 1rem; margin-bottom: 1.5rem; border-radius: 4px;">
+                        <h3 style="color: var(--negative); margin-bottom: 0.5rem;">Reconciliation Warning</h3>
+                        <p id="reconciliation-msg"></p>
+                    </div>
+                    <!-- Runway & Totals -->
+                    <div class="overview-grid" style="grid-template-columns: 1fr;">
+                        <div class="stat-card glass-panel accent">
+                            <h3>Available Balance</h3>
+                            <div class="stat-value" id="stat-balance" style="font-size: 1.8rem; display: flex; align-items: center; height: 100%;">₹0</div>
+                        </div>
+                    </div>
+
+                    <!-- Month Verdicts -->
+                    <div class="glass-panel" style="margin-bottom: 1.5rem;">
+                        <h3 style="margin-bottom: 1rem;">Month-by-Month Verdicts</h3>
+                        <div class="verdicts-grid" id="month-verdicts-container">
+                            <!-- Populated via JS -->
+                        </div>
+                    </div>
+
+                    <!-- Top 5 Categories & Insights -->
+                    <div class="glass-panel">
+                        <h3 style="margin-bottom: 1rem;">Top Categories & Insights</h3>
+                        <ul id="top-categories-list" class="category-list">
+                            <!-- Populated via JS -->
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- TAB: 2. MONTHLY TRENDS -->
+                <div id="tab-monthly" class="tab-content" style="display: none;">
+                    <div class="charts-grid">
+                        <div class="chart-card glass-panel" style="grid-column: 1 / -1;">
+                            <h3>Monthly Spend & Net Savings</h3>
+                            <p style="font-size:0.8rem; color:var(--text-muted); margin-bottom:1rem;">Click a bar to filter transactions.</p>
+                            <div class="chart-container" style="height: 400px;">
+                                <canvas id="monthlySpendChart"></canvas>
+                            </div>
+                        </div>
+                        <div class="chart-card glass-panel" style="grid-column: 1 / -1;">
+                            <h3>Category Breakdown (Top 6 + Other)</h3>
+                            <div class="chart-container" style="height: 400px;">
+                                <canvas id="monthlyCategoryChart"></canvas>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: 3. CATEGORY EXPLORER -->
+                <div id="tab-category" class="tab-content" style="display: none;">
+                    <div class="glass-panel">
+                        <div class="table-header" style="flex-wrap: wrap; gap: 1rem;">
+                            <div>
+                                <h3>Category Explorer</h3>
+                                <p style="font-size:0.8rem; color:var(--text-muted);">Click a category to view its transactions.</p>
+                            </div>
+                            <select id="filter-cat-explorer-month" class="ui-select">
+                                <option value="All">All Months</option>
+                            </select>
+                        </div>
+                        <div class="table-wrapper">
+                            <table id="category-explorer-table" class="sortable-table">
+                                <thead>
+                                    <tr>
+                                        <th data-sort="name">Category ⇕</th>
+                                        <th data-sort="amount">Amount ⇕</th>
+                                        <th data-sort="count">Txn Count ⇕</th>
+                                        <th data-sort="avg">Avg/Txn ⇕</th>
+                                        <th data-sort="percent">% of Total ⇕</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- Populated via JS -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: 4. TRANSACTIONS -->
+                <div id="tab-transactions" class="tab-content" style="display: none;">
+                    <div class="table-card glass-panel">
+                        <div class="table-header" style="flex-wrap: wrap; gap: 1rem;">
+                            <h3>All Transactions</h3>
+                            <div style="display: flex; gap: 0.5rem; flex-wrap: wrap;">
+                                <select id="filter-type" class="ui-select">
+                                    <option value="All">All Types</option>
+                                    <option value="Debit">Debits Only</option>
+                                    <option value="Credit">Credits Only</option>
+                                </select>
+                                <select id="filter-month" class="ui-select"><option value="All">All Months</option></select>
+                                <select id="filter-category" class="ui-select"><option value="All">All Categories</option></select>
+                                <input type="text" id="tx-search" placeholder="Search merchant, note...">
+                            </div>
+                            <div id="tx-summary" style="width: 100%; margin-top: 0.5rem; font-weight: 600; font-size: 1.1rem; display: flex; gap: 1rem;">
+                                <span style="color: var(--negative);">Total Debits: ₹0</span>
+                                <span style="color: var(--positive);">Total Credits: ₹0</span>
+                                <span style="color: var(--accent);">Net: ₹0</span>
+                            </div>
+                        </div>
+                        <div class="table-wrapper" style="max-height: 600px; overflow-y: auto;">
+                            <table id="tx-table" class="sortable-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width:40px;">+</th>
+                                        <th data-sort="date">Date ⇕</th>
+                                        <th data-sort="merchant">Merchant ⇕</th>
+                                        <th data-sort="note">Note ⇕</th>
+                                        <th data-sort="category">Category ⇕</th>
+                                        <th data-sort="amount">Amount ⇕</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    <!-- Populated via JS -->
+                                </tbody>
+                            </table>
+                        </div>
+                        <!-- Pagination controls -->
+                        <div class="pagination-controls" style="display: flex; justify-content: space-between; margin-top: 1rem; align-items: center;">
+                            <button id="page-prev" class="btn-primary" style="padding: 0.5rem 1rem;">Previous</button>
+                            <span id="page-info">Page 1 of 1</span>
+                            <button id="page-next" class="btn-primary" style="padding: 0.5rem 1rem;">Next</button>
+                        </div>
+                        <!-- Calculator Tray -->
+                        <div id="calc-tray" style="display:none; margin-top: 1rem; padding: 1rem 1.5rem; background: rgba(139,92,246,0.15); border: 1px solid var(--accent); border-radius: 10px; display:none; align-items:center; gap:1.5rem; flex-wrap:wrap;">
+                            <span style="font-size:1.1rem;">🧮 <strong>Calculator</strong></span>
+                            <span id="calc-count" style="color:var(--text-muted);">0 selected</span>
+                            <span id="calc-total" style="font-size:1.3rem; font-weight:700; color:var(--accent);">₹0</span>
+                            <span id="calc-breakdown" style="color:var(--text-muted); font-size:0.85rem;"></span>
+                            <button id="calc-clear" class="btn-primary" style="padding:0.3rem 0.9rem; margin-left:auto; font-size:0.85rem;">Clear All</button>
+                        </div>
+                    </div>
+                </div>
+                </div>
+
+                <!-- TAB: 5. TOP & FREQUENT -->
+                <div id="tab-top" class="tab-content" style="display: none;">
+                    <div class="charts-grid" style="grid-template-columns: 1fr 1fr;">
+                        <div class="table-card glass-panel">
+                            <h3>Biggest 15 Payments</h3>
+                            <div class="table-wrapper">
+                                <table id="top-15-table">
+                                    <thead><tr><th>Date</th><th>Merchant</th><th>Category</th><th>Amount</th></tr></thead>
+                                    <tbody><!-- Populated via JS --></tbody>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="table-card glass-panel">
+                            <h3>Most Frequent Merchants</h3>
+                            <div class="table-wrapper">
+                                <table id="frequent-table">
+                                    <thead><tr><th>Merchant</th><th>Count</th><th>Total Spent</th></tr></thead>
+                                    <tbody><!-- Populated via JS --></tbody>
+                                </table>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: 6. NEEDS VS WANTS -->
+                <div id="tab-needs" class="tab-content" style="display: none;">
+                    <div class="glass-panel" style="margin-bottom: 1.5rem;">
+                        <h3>Needs vs Wants Split</h3>
+                        <div id="needs-wants-callout" style="margin: 1rem 0; padding: 1rem; background: rgba(255,255,255,0.05); border-left: 4px solid var(--accent); border-radius: 4px;">
+                            <!-- Populated via JS -->
+                        </div>
+                        <div class="chart-container" style="height: 400px;">
+                            <canvas id="needsWantsChart"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- TAB: 7. CREDIT CARDS -->
+                <div id="tab-cc" class="tab-content" style="display: none;">
+                    <div class="glass-panel">
+                        <h2>Credit Card Analysis</h2>
+                        <p>No credit card data available.</p>
+                    </div>
+                </div>
+
+            </section>
+        </main>
+    </div>
+    
+    <!-- Misc Categorization Modal -->
+    <div id="misc-modal" class="modal" style="display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4);">
+        <div class="modal-content glass-panel" style="margin: 15% auto; padding: 20px; width: 80%; max-width: 400px;">
+            <span class="close" id="close-modal" style="color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer;">&times;</span>
+            <h2>Re-assign 'Misc/Other'</h2>
+            <p id="misc-merchant-name" style="margin-top: 1rem; color: var(--text-muted);"></p>
+            <select id="misc-category-select" class="ui-select" style="width: 100%; margin: 1rem 0;">
+                <option value="Food & Dining">Food & Dining</option>
+                <option value="Groceries">Groceries</option>
+                <option value="Shopping">Shopping</option>
+                <option value="Cab/Transport">Cab/Transport</option>
+                <option value="Medical/Health">Medical/Health</option>
+                <option value="Personal Care">Personal Care</option>
+                <option value="Sports/Fitness">Sports/Fitness</option>
+                <option value="Family/Self Transfer">Family/Self Transfer</option>
+            </select>
+            <button id="misc-save-btn" class="btn-primary" style="width: 100%;">Save Category</button>
+        </div>
+    </div>
+
+    <div id="month-modal" class="modal" style="display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4);">
+        <div class="modal-content glass-panel" style="margin: 15% auto; padding: 20px; width: 80%; max-width: 400px;">
+            <span class="close" id="close-month-modal" style="color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer;">&times;</span>
+            <h2>Re-assign Month</h2>
+            <p id="month-tx-info" style="margin-top: 1rem; color: var(--text-muted);"></p>
+            <select id="month-select" class="ui-select" style="width: 100%; margin: 1rem 0;">
+                <option value="Jan 2026">Jan 2026</option>
+                <option value="Feb 2026">Feb 2026</option>
+                <option value="Mar 2026">Mar 2026</option>
+                <option value="Apr 2026">Apr 2026</option>
+                <option value="May 2026">May 2026</option>
+                <option value="Jun 2026">Jun 2026</option>
+                <option value="Jul 2026">Jul 2026</option>
+                <option value="Aug 2026">Aug 2026</option>
+                <option value="Sep 2026">Sep 2026</option>
+                <option value="Oct 2026">Oct 2026</option>
+                <option value="Nov 2026">Nov 2026</option>
+                <option value="Dec 2026">Dec 2026</option>
+            </select>
+            <button id="month-save-btn" class="btn-primary" style="width: 100%;">Save Month</button>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>

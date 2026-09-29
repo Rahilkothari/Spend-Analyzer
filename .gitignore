@@ -14,3 +14,5 @@ tx_overrides.json
 
 # OS files
 .DS_Store
+
+scratch/

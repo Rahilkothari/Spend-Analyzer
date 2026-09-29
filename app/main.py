@@ -2,19 +2,34 @@ from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 import os
+import sys
 import shutil
 import tempfile
 import json
 import datetime
 import hashlib
 from collections import defaultdict
+from pathlib import Path
 from app.parser import parse_bank_statement
 from app.categorizer import load_user_mappings, get_needs_wants_mapping
+import google.generativeai as genai
+from pydantic import BaseModel
+from typing import Dict, Any, Optional, List
+
+# Ensure persistent data directory exists
+DATA_DIR = Path.home() / ".spend_analyzer"
+DATA_DIR.mkdir(exist_ok=True)
+
+# Resolve static directory for PyInstaller
+def get_static_path():
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, 'static')
+    return "static"
 
 app = FastAPI()
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=get_static_path()), name="static")
 
-TX_OVERRIDES_FILE = "tx_overrides.json"
+TX_OVERRIDES_FILE = DATA_DIR / "tx_overrides.json"
 _tx_overrides = {}
 
 def load_tx_overrides():
@@ -39,7 +54,8 @@ load_tx_overrides()
 
 @app.get("/", response_class=HTMLResponse)
 async def read_index():
-    with open("static/index.html", "r", encoding="utf-8") as f:
+    index_path = os.path.join(get_static_path(), "index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
 def parse_month_year(date_str):
@@ -132,6 +148,9 @@ def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
     avg_monthly_net_burn = sum(monthly_net_burns.values()) / len(months_set) if months_set else 0
     runway = round(closing_balance / avg_monthly_net_burn, 1) if avg_monthly_net_burn > 0 else "Infinite"
 
+    investments_total = category_sums.get("Investments", 0)
+    actual_spent = total_out - investments_total
+
     overview = {
         "total_in": total_in,
         "total_out": total_out,
@@ -139,7 +158,9 @@ def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
         "opening_balance": opening_balance,
         "closing_balance": closing_balance,
         "runway": runway,
-        "reconciliation_diff": reconciliation_diff
+        "reconciliation_diff": reconciliation_diff,
+        "investments_total": investments_total,
+        "actual_spent": actual_spent
     }
 
     categories = []
@@ -233,10 +254,39 @@ async def process_upload(
         closing_balance = transactions[-1].get("balance", 0) if transactions else 0
 
         dashboard_data = aggregate_dashboard_data(transactions, opening_balance, closing_balance)
+        
+        # Save session
+        with open(DATA_DIR / "current_data.json", "w") as f:
+            json.dump({"transactions": transactions, "opening_balance": opening_balance, "closing_balance": closing_balance}, f)
+            
         return {"status": "success", "data": dashboard_data}
     except Exception as e:
         print(f"Parsing Error: {str(e)}")
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/load-session")
+async def load_session():
+    data_file = DATA_DIR / "current_data.json"
+    if os.path.exists(data_file):
+        try:
+            with open(data_file, "r") as f:
+                saved = json.load(f)
+            transactions = saved.get("transactions", [])
+            ob = saved.get("opening_balance", 0)
+            cb = saved.get("closing_balance", 0)
+            if transactions:
+                dashboard_data = aggregate_dashboard_data(transactions, ob, cb)
+                return {"status": "success", "data": dashboard_data}
+        except Exception as e:
+            print(f"Session load error: {e}")
+    return {"status": "error", "message": "No active session"}
+
+@app.post("/api/clear-session")
+async def clear_session():
+    data_file = DATA_DIR / "current_data.json"
+    if os.path.exists(data_file):
+        os.remove(data_file)
+    return {"status": "success"}
 
 @app.post("/api/mapping")
 async def update_mapping(request: Request):
@@ -248,15 +298,16 @@ async def update_mapping(request: Request):
         return {"status": "error", "message": "Missing merchant or category"}
         
     mappings = {}
-    if os.path.exists("user_mappings.json"):
-        with open("user_mappings.json", "r") as f:
+    mapping_file = DATA_DIR / "user_mappings.json"
+    if os.path.exists(mapping_file):
+        with open(mapping_file, "r") as f:
             try:
                 mappings = json.load(f)
             except:
                 pass
                 
     mappings[merchant] = category
-    with open("user_mappings.json", "w") as f:
+    with open(mapping_file, "w") as f:
         json.dump(mappings, f, indent=4)
         
     load_user_mappings()
@@ -288,17 +339,94 @@ async def recalculate_dashboard(request: Request):
         opening_balance = transactions[0].get("balance", 0) if transactions else 0
         closing_balance = transactions[-1].get("balance", 0) if transactions else 0
         
+        # Update the session file so refreshes keep the modified state
+        with open(DATA_DIR / "current_data.json", "w") as f:
+            json.dump({"transactions": transactions, "opening_balance": opening_balance, "closing_balance": closing_balance}, f)
+            
         dashboard_data = aggregate_dashboard_data(transactions, opening_balance, closing_balance)
         return {"status": "success", "data": dashboard_data}
     except Exception as e:
         print(f"Recalculate Error: {str(e)}")
         return {"status": "error", "message": str(e)}
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatRequest(BaseModel):
+    message: str
+    history: List[ChatMessage]
+    context_data: Dict[str, Any]
+    api_key: Optional[str] = None
+
+@app.post("/api/chat")
+async def chat_endpoint(request: ChatRequest):
+    try:
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            return {"status": "error", "message": "API key not configured."}
+        
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-2.5-flash')
+        
+        # Prepare context
+        context_str = json.dumps(request.context_data, indent=2)
+        system_prompt = f"You are a helpful financial assistant. You have access to the user's parsed bank statement and dashboard data. Use this data to answer their questions accurately and concisely.\n\nContext Data:\n{context_str}"
+        
+        # Convert history
+        messages = [{"role": "user", "parts": [system_prompt]}]
+        # Gemini expects alternating user/model if using chat history, but since we are just passing context, 
+        # let's just build a single prompt or use the chat session.
+        # Actually, let's just use generate_content with all history as a single prompt for simplicity.
+        
+        prompt = system_prompt + "\n\nChat History:\n"
+        for msg in request.history:
+            prompt += f"{msg.role.capitalize()}: {msg.content}\n"
+        
+        prompt += f"User: {request.message}\nAssistant:"
+        
+        response = model.generate_content(prompt)
+        return {"status": "success", "reply": response.text}
+    except Exception as e:
+        print(f"Chat Error: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
 @app.post("/api/export")
 async def export_excel(request: Request):
     try:
+        import pandas as pd
+        import io
+        from fastapi.responses import StreamingResponse
+
         data = await request.json()
-        # Stub for export
-        return {"status": "error", "message": "Export functionality temporarily removed"}
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            if "overview" in data:
+                pd.DataFrame([data["overview"]]).to_excel(writer, sheet_name="Overview", index=False)
+            
+            if "transactions" in data:
+                df_tx = pd.DataFrame(data["transactions"])
+                if not df_tx.empty:
+                    df_tx = df_tx.drop(columns=["tx_id"], errors="ignore")
+                df_tx.to_excel(writer, sheet_name="Transactions", index=False)
+            
+            if "categories" in data:
+                pd.DataFrame(data["categories"]).to_excel(writer, sheet_name="Categories", index=False)
+                
+            if "top_15_overall" in data:
+                pd.DataFrame(data["top_15_overall"]).to_excel(writer, sheet_name="Top 15 Overall", index=False)
+                
+            if "top_frequent" in data:
+                pd.DataFrame(data["top_frequent"]).to_excel(writer, sheet_name="Top Frequent", index=False)
+                
+        output.seek(0)
+        
+        headers = {
+            'Content-Disposition': 'attachment; filename="budget_analysis.xlsx"'
+        }
+        return StreamingResponse(output, headers=headers, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        
     except Exception as e:
+        print(f"Export Error: {str(e)}")
         return {"status": "error", "message": str(e)}

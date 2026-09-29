@@ -8,6 +8,22 @@ document.addEventListener('DOMContentLoaded', () => {
     let dashboardData = null;
     let currentTxPage = 1;
     const TX_PER_PAGE = 50;
+    
+    // Load active session if it exists
+    fetch('/api/load-session').then(res => res.json()).then(result => {
+        if (result.status === 'success' && result.data) {
+            dashboardData = result.data;
+            uploadView.style.display = 'none';
+            renderDashboard(dashboardData);
+            
+            // Restore active tab
+            const savedTab = localStorage.getItem('activeTab');
+            if (savedTab) {
+                const btn = document.querySelector(`.tab-btn[data-target="${savedTab}"]`);
+                if (btn) btn.click();
+            }
+        }
+    }).catch(e => console.log('No session found'));
 
     // File input label updating
     document.querySelectorAll('.file-input').forEach(input => {
@@ -29,6 +45,7 @@ document.addEventListener('DOMContentLoaded', () => {
             e.target.classList.add('active');
             const targetId = e.target.getAttribute('data-target');
             document.getElementById(targetId).style.display = 'block';
+            localStorage.setItem('activeTab', targetId);
         });
     });
 
@@ -89,13 +106,19 @@ document.addEventListener('DOMContentLoaded', () => {
         processingView.style.display = 'none';
         dashboardView.style.display = 'block';
         exportBtn.style.display = 'block';
+        const clearBtn = document.getElementById('clear-session-btn');
+        if (clearBtn) clearBtn.style.display = 'block';
 
         renderOverview(data);
         renderMonthlyTrends(data);
-        renderCategoryExplorer(data);
+        
+        const catExpMonth = document.getElementById('filter-cat-explorer-month') ? document.getElementById('filter-cat-explorer-month').value : 'All';
+        renderCategoryExplorer(data, catExpMonth);
+        
         setupTransactions(data);
         renderTopFrequent(data);
         renderNeedsWants(data);
+        renderSplits(data);
     }
 
     function renderOverview(data) {
@@ -108,6 +131,19 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('reconciliation-msg').textContent = `Warning: The net computed from transactions differs from the statement balance change by ₹${o.reconciliation_diff}. Some transactions may have been missed or duplicated.`;
         } else {
             document.getElementById('reconciliation-alert').style.display = 'none';
+        }
+
+        // Investment Note
+        const invNote = document.getElementById('investment-note');
+        if (o.investments_total > 0) {
+            invNote.style.display = 'block';
+            document.getElementById('investment-note-msg').innerHTML = `
+                Your total outflow was <strong>${formatCurrency(o.total_out)}</strong>. <br>
+                However, <strong>${formatCurrency(o.investments_total)}</strong> of that was moved into <strong>Investments</strong>. <br>
+                Therefore, your actual total spent is <strong style="color:var(--text); font-size:1.1rem;">${formatCurrency(o.actual_spent)}</strong>.
+            `;
+        } else {
+            invNote.style.display = 'none';
         }
 
         // Top 5 Categories & Insights
@@ -321,6 +357,24 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     let filteredTxs = [];
+    let filtersInitialized = false;
+    let currentSortKey = null;
+    let currentSortAsc = false;
+    
+    function applySort() {
+        if (!currentSortKey) return;
+        filteredTxs.sort((a, b) => {
+            let valA = a[currentSortKey];
+            let valB = b[currentSortKey];
+            if (currentSortKey === 'amount') { valA = parseFloat(valA); valB = parseFloat(valB); }
+            if (valA < valB) return -1;
+            if (valA > valB) return 1;
+            return 0;
+        });
+        if (!currentSortAsc) {
+            filteredTxs.reverse();
+        }
+    }
     
     function setupTransactions(data) {
         filteredTxs = [...data.transactions];
@@ -331,63 +385,71 @@ document.addEventListener('DOMContentLoaded', () => {
         const debitsMonthSelect = document.getElementById('filter-debits-month');
         const debitsCatSelect = document.getElementById('filter-debits-category');
         
-        // Populate filters
-        const months = [...new Set(data.transactions.filter(t => t.month_year && t.month_year !== 'Unknown').map(t => t.month_year))];
-        months.sort((a, b) => new Date(a) - new Date(b));
-        months.forEach(m => {
-            const opt1 = document.createElement('option'); opt1.value = m; opt1.textContent = m;
-            monthSelect.appendChild(opt1);
-            const opt2 = document.createElement('option'); opt2.value = m; opt2.textContent = m;
-            catExplorerMonthSelect.appendChild(opt2);
-        });
-        
-        catExplorerMonthSelect.addEventListener('change', (e) => {
-            renderCategoryExplorer(data, e.target.value);
-        });
+        if (!filtersInitialized) {
+            // Clear before populating
+            if (monthSelect) monthSelect.innerHTML = '<option value="All">All Months</option>';
+            if (catExplorerMonthSelect) catExplorerMonthSelect.innerHTML = '<option value="All">All Months</option>';
+            if (catSelect) catSelect.innerHTML = '<option value="All">All Categories</option>';
 
-        data.categories.forEach(c => {
-            const opt = document.createElement('option');
-            opt.value = c.name; opt.textContent = c.name;
-            catSelect.appendChild(opt);
-        });
-        
-        // Listeners for All Transactions
-        const typeSelect = document.getElementById('filter-type');
-        if (typeSelect) typeSelect.addEventListener('change', filterTransactions);
-        monthSelect.addEventListener('change', filterTransactions);
-        catSelect.addEventListener('change', filterTransactions);
-        document.getElementById('tx-search').addEventListener('keyup', filterTransactions);
-        
-        document.getElementById('page-prev').addEventListener('click', () => {
-            if (currentTxPage > 1) { currentTxPage--; renderTxTable(); }
-        });
-        document.getElementById('page-next').addEventListener('click', () => {
-            if (currentTxPage * TX_PER_PAGE < filteredTxs.length) { currentTxPage++; renderTxTable(); }
-        });
-        
-        // Sorting for All Transactions
-        document.querySelectorAll('#tx-table th[data-sort]').forEach(th => {
-            th.addEventListener('click', () => {
-                const sortKey = th.getAttribute('data-sort');
-                filteredTxs.sort((a, b) => {
-                    let valA = a[sortKey];
-                    let valB = b[sortKey];
-                    if (sortKey === 'amount') { valA = parseFloat(valA); valB = parseFloat(valB); }
-                    if (valA < valB) return -1;
-                    if (valA > valB) return 1;
-                    return 0;
-                });
-                // Toggle reverse
-                if (th.classList.contains('asc')) {
-                    filteredTxs.reverse();
-                    th.classList.remove('asc');
-                } else {
-                    th.classList.add('asc');
-                }
-                currentTxPage = 1;
-                renderTxTable();
+            // Populate filters
+            const months = [...new Set(data.transactions.filter(t => t.month_year && t.month_year !== 'Unknown').map(t => t.month_year))];
+            months.sort((a, b) => new Date(a) - new Date(b));
+            months.forEach(m => {
+                const opt1 = document.createElement('option'); opt1.value = m; opt1.textContent = m;
+                if (monthSelect) monthSelect.appendChild(opt1);
+                const opt2 = document.createElement('option'); opt2.value = m; opt2.textContent = m;
+                if (catExplorerMonthSelect) catExplorerMonthSelect.appendChild(opt2);
             });
-        });
+
+            data.categories.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.name; opt.textContent = c.name;
+                if (catSelect) catSelect.appendChild(opt);
+            });
+            
+            if (catExplorerMonthSelect) catExplorerMonthSelect.addEventListener('change', (e) => {
+                renderCategoryExplorer(dashboardData, e.target.value);
+            });
+        
+            // Listeners for All Transactions
+            const typeSelect = document.getElementById('filter-type');
+            if (typeSelect) typeSelect.addEventListener('change', filterTransactions);
+            if (monthSelect) monthSelect.addEventListener('change', filterTransactions);
+            if (catSelect) catSelect.addEventListener('change', filterTransactions);
+            
+            const txSearch = document.getElementById('tx-search');
+            if (txSearch) txSearch.addEventListener('keyup', filterTransactions);
+            
+            const pagePrev = document.getElementById('page-prev');
+            if (pagePrev) pagePrev.addEventListener('click', () => {
+                if (currentTxPage > 1) { currentTxPage--; renderTxTable(); }
+            });
+            const pageNext = document.getElementById('page-next');
+            if (pageNext) pageNext.addEventListener('click', () => {
+                if (currentTxPage * TX_PER_PAGE < filteredTxs.length) { currentTxPage++; renderTxTable(); }
+            });
+            
+            // Sorting for All Transactions
+            document.querySelectorAll('#tx-table th[data-sort]').forEach(th => {
+                th.addEventListener('click', () => {
+                    const sortKey = th.getAttribute('data-sort');
+                    if (currentSortKey === sortKey) {
+                        currentSortAsc = !currentSortAsc;
+                    } else {
+                        currentSortKey = sortKey;
+                        currentSortAsc = true;
+                    }
+                    
+                    document.querySelectorAll('#tx-table th').forEach(el => el.classList.remove('asc'));
+                    if (currentSortAsc) th.classList.add('asc');
+                    
+                    applySort();
+                    currentTxPage = 1;
+                    renderTxTable();
+                });
+            });
+            filtersInitialized = true;
+        }
 
         filterTransactions();
     }
@@ -437,6 +499,7 @@ document.addEventListener('DOMContentLoaded', () => {
             `;
         }
         
+        applySort();
         currentTxPage = 1;
         renderTxTable();
     }
@@ -509,6 +572,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td>${noteHtml}</td>
                 <td>${catHtml}</td>
                 <td class="${typeClass}" style="font-weight:600;">${formatCurrency(tx.amount)}</td>
+                <td>
+                    ${tx.type === 'Debit' ? `<button class="btn-primary" style="padding: 2px 6px; font-size: 0.75rem;" onclick="splitTransaction('${tx.tx_id}', ${tx.amount})">Split ✂️</button>` : ''}
+                </td>
             `;
 
             // Wire up the + button
@@ -655,7 +721,6 @@ document.addEventListener('DOMContentLoaded', () => {
             const resData = await response.json();
             if (resData.status === 'success') {
                 dashboardData = resData.data;
-                populateFilters();
                 filterTransactions();
                 renderDashboard(dashboardData);
             }
@@ -723,7 +788,6 @@ document.addEventListener('DOMContentLoaded', () => {
             const resData = await response.json();
             if (resData.status === 'success') {
                 dashboardData = resData.data;
-                populateFilters();
                 filterTransactions();
                 renderDashboard(dashboardData);
             } else {
@@ -736,6 +800,109 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
+
+    // Split Logic
+    window.splitTransaction = async function(txId, currentAmount) {
+        const newAmount = prompt(`This transaction is currently ₹${currentAmount}.\n\nEnter YOUR actual share (e.g. 680):`);
+        if (newAmount === null || newAmount.trim() === '') return;
+        
+        const amountNum = parseFloat(newAmount);
+        if (isNaN(amountNum) || amountNum < 0) {
+            alert('Invalid amount');
+            return;
+        }
+
+        // Apply override locally
+        const tx = dashboardData.transactions.find(t => t.tx_id === txId);
+        if (tx) {
+            tx.original_amount = tx.original_amount || tx.amount; // Store original
+            tx.amount = amountNum;
+        }
+
+        try {
+            await fetch('/api/tx-override', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tx_id: txId, field: 'amount', value: amountNum })
+            });
+            // Also store original amount if it's the first time
+            if (tx && tx.original_amount) {
+                await fetch('/api/tx-override', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tx_id: txId, field: 'original_amount', value: tx.original_amount })
+                });
+            }
+
+            const response = await fetch('/api/recalculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ transactions: dashboardData.transactions })
+            });
+            const resData = await response.json();
+            if (resData.status === 'success') {
+                dashboardData = resData.data;
+                filterTransactions();
+                renderDashboard(dashboardData);
+                alert('Transaction updated! NOTE: If your friends send you money back for this, mark their payments as "Ignored/Refund" so they don\'t count twice.');
+            }
+        } catch(e) {
+            console.error(e);
+            alert('Failed to update amount');
+        }
+    };
+
+    window.resetSplit = async function(txId, originalAmount) {
+        if (!confirm('Restore original amount?')) return;
+        try {
+            await fetch('/api/tx-override', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tx_id: txId, field: 'amount', value: originalAmount })
+            });
+            
+            const tx = dashboardData.transactions.find(t => t.tx_id === txId);
+            if (tx) tx.amount = originalAmount;
+            
+            const response = await fetch('/api/recalculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ transactions: dashboardData.transactions })
+            });
+            const resData = await response.json();
+            if (resData.status === 'success') {
+                dashboardData = resData.data;
+                filterTransactions();
+                renderDashboard(dashboardData);
+            }
+        } catch(e) {
+            console.error(e);
+        }
+    };
+
+    function renderSplits(data) {
+        const tbody = document.querySelector('#splits-table tbody');
+        if (!tbody) return;
+        tbody.innerHTML = '';
+        
+        const splitTxs = data.transactions.filter(t => t.original_amount && t.original_amount !== t.amount);
+        if (splitTxs.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:var(--text-muted);">No split transactions yet. Go to Transactions tab and click "Split ✂️" on a payment.</td></tr>';
+            return;
+        }
+
+        splitTxs.forEach(tx => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+                <td>${tx.date}</td>
+                <td>${tx.merchant}</td>
+                <td style="color:var(--text-muted); text-decoration:line-through;">${formatCurrency(tx.original_amount)}</td>
+                <td class="debit" style="font-weight:bold;">${formatCurrency(tx.amount)}</td>
+                <td><button class="btn-primary" style="padding: 2px 6px; font-size: 0.75rem; background: var(--negative);" onclick="resetSplit('${tx.tx_id}', ${tx.original_amount})">Reset</button></td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
 
     // Export Logic
     exportBtn.addEventListener('click', async () => {
@@ -765,4 +932,88 @@ document.addEventListener('DOMContentLoaded', () => {
             exportBtn.textContent = 'Export Excel Report';
         }
     });
+
+    // AI Assistant Logic
+    const chatInput = document.getElementById('chat-input');
+    const chatSendBtn = document.getElementById('chat-send-btn');
+    const chatHistoryEl = document.getElementById('chat-history');
+    let chatHistory = [];
+
+    async function sendChatMessage() {
+        const message = chatInput.value.trim();
+        if (!message) return;
+        if (!dashboardData) {
+            alert('Please upload a statement first to use the assistant.');
+            return;
+        }
+
+        // Add user message to UI
+        const userMsgDiv = document.createElement('div');
+        userMsgDiv.className = 'chat-message user';
+        userMsgDiv.style = 'background: rgba(59, 130, 246, 0.2); padding: 0.8rem; border-radius: 8px; align-self: flex-end; max-width: 80%;';
+        userMsgDiv.textContent = message;
+        chatHistoryEl.appendChild(userMsgDiv);
+        
+        chatInput.value = '';
+        chatHistoryEl.scrollTop = chatHistoryEl.scrollHeight;
+
+        const originalBtnText = chatSendBtn.textContent;
+        chatSendBtn.textContent = '...';
+        chatSendBtn.disabled = true;
+
+        try {
+            const response = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    message: message,
+                    history: chatHistory,
+                    context_data: {
+                        overview: dashboardData.overview,
+                        top_transactions: dashboardData.top_15_overall,
+                        categories: dashboardData.categories,
+                        top_merchants: dashboardData.top_frequent,
+                        monthly_trends: dashboardData.monthly_trends
+                    }
+                })
+            });
+
+            const data = await response.json();
+            if (data.status === 'success') {
+                chatHistory.push({ role: 'user', content: message });
+                chatHistory.push({ role: 'model', content: data.reply });
+
+                const botMsgDiv = document.createElement('div');
+                botMsgDiv.className = 'chat-message bot';
+                botMsgDiv.style = 'background: rgba(139,92,246,0.2); padding: 0.8rem; border-radius: 8px; align-self: flex-start; max-width: 80%;';
+                // Very basic markdown handling for bold text
+                botMsgDiv.innerHTML = data.reply.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>').replace(/\n/g, '<br>');
+                chatHistoryEl.appendChild(botMsgDiv);
+            } else {
+                alert('Assistant Error: ' + data.message);
+            }
+        } catch (e) {
+            console.error(e);
+            alert('Failed to communicate with the assistant.');
+        } finally {
+            chatSendBtn.textContent = originalBtnText;
+            chatSendBtn.disabled = false;
+            chatHistoryEl.scrollTop = chatHistoryEl.scrollHeight;
+        }
+    }
+
+    if (chatSendBtn) chatSendBtn.addEventListener('click', sendChatMessage);
+    if (chatInput) chatInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') sendChatMessage();
+    });
+
+    const clearSessionBtn = document.getElementById('clear-session-btn');
+    if (clearSessionBtn) {
+        clearSessionBtn.addEventListener('click', async () => {
+            if (confirm("Are you sure you want to clear your data and start over?")) {
+                await fetch('/api/clear-session', { method: 'POST' });
+                window.location.reload();
+            }
+        });
+    }
 });
