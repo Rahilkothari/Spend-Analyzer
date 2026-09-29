@@ -363,6 +363,12 @@ class ChatRequest(BaseModel):
 async def chat_endpoint(request: ChatRequest):
     try:
         api_key = os.getenv("GEMINI_API_KEY", "")
+        config_path = DATA_DIR / "config.json"
+        if not api_key and os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+                api_key = config_data.get("GEMINI_API_KEY", "")
+                
         if not api_key:
             return {"status": "error", "message": "API key not configured."}
         
