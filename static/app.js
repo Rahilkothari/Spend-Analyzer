@@ -17,7 +17,8 @@ document.addEventListener('DOMContentLoaded', () => {
             renderDashboard(dashboardData);
             
             // Restore active tab
-            const savedTab = localStorage.getItem('activeTab');
+            let savedTab = localStorage.getItem('activeTab');
+            if (savedTab === 'tab-monthly' || savedTab === 'tab-needs') savedTab = 'tab-overview';
             if (savedTab) {
                 const btn = document.querySelector(`.tab-btn[data-target="${savedTab}"]`);
                 if (btn) btn.click();
@@ -25,44 +26,110 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }).catch(e => console.log('No session found'));
 
-    // File input label updating
-    document.querySelectorAll('.file-input').forEach(input => {
+    // Multi-file input display helper
+    function setupFileInput(inputId, msgId, listId) {
+        const input = document.getElementById(inputId);
+        const msg = document.getElementById(msgId);
+        const list = document.getElementById(listId);
+        if (!input) return;
+
         input.addEventListener('change', function() {
-            if (this.files && this.files[0]) {
-                let msg = this.parentElement.querySelector('.file-msg');
-                msg.textContent = this.files[0].name;
-                msg.style.color = 'var(--accent)';
+            if (this.files && this.files.length > 0) {
+                if (msg) {
+                    if (this.files.length === 1) {
+                        msg.textContent = this.files[0].name;
+                    } else {
+                        msg.textContent = `${this.files.length} statement files selected`;
+                    }
+                    msg.style.color = 'var(--accent)';
+                }
+
+                if (list) {
+                    list.innerHTML = '';
+                    list.style.display = 'block';
+                    Array.from(this.files).forEach(f => {
+                        const chip = document.createElement('span');
+                        chip.className = 'file-chip';
+                        const sizeKb = (f.size / 1024).toFixed(0);
+                        chip.innerHTML = `📄 <strong>${f.name}</strong> <span style="opacity:0.7">(${sizeKb} KB)</span>`;
+                        list.appendChild(chip);
+                    });
+                }
             }
+        });
+    }
+
+    setupFileInput('bank-statement', 'upload-file-msg', 'upload-file-list');
+    setupFileInput('append-bank-statement', 'append-file-msg', 'append-file-list');
+
+    // Tab Switching
+    function activateTab(targetId, skipHistory = false) {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
+        
+        const btn = document.querySelector(`.tab-btn[data-target="${targetId}"]`);
+        if (btn) btn.classList.add('active');
+        const content = document.getElementById(targetId);
+        if (content) content.style.display = 'block';
+        
+        localStorage.setItem('activeTab', targetId);
+        
+                if (targetId === 'tab-insights' && window.dashboardData) {
+            setTimeout(() => {
+                if (window.renderSpendInsights) window.renderSpendInsights(window.dashboardData);
+            }, 60);
+        }
+
+        if (targetId === 'tab-monthly-breakdown' && window.dashboardData) {
+            setTimeout(() => {
+                if (window.renderMonthlyCategoryChart) window.renderMonthlyCategoryChart(window.dashboardData);
+            }, 60);
+        }
+
+        if (!skipHistory) {
+            history.pushState({ tab: targetId }, '', `#${targetId}`);
+        }
+    }
+
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            const targetId = e.target.getAttribute('data-target');
+            activateTab(targetId);
         });
     });
 
-    // Tab Switching
-    document.querySelectorAll('.tab-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.style.display = 'none');
-            
-            e.target.classList.add('active');
-            const targetId = e.target.getAttribute('data-target');
-            document.getElementById(targetId).style.display = 'block';
-            localStorage.setItem('activeTab', targetId);
-        });
+    window.addEventListener('popstate', (e) => {
+        if (e.state && e.state.tab) {
+            activateTab(e.state.tab, true);
+        } else {
+            // Fallback if no state
+            const savedTab = localStorage.getItem('activeTab') || 'tab-overview';
+            activateTab(savedTab, true);
+        }
     });
 
     // Switch to tab programmatically
     function switchTab(targetId) {
-        document.querySelector(`.tab-btn[data-target="${targetId}"]`).click();
+        activateTab(targetId);
     }
 
     uploadForm.addEventListener('submit', async (e) => {
         e.preventDefault();
         
+        const fileInput = document.getElementById('bank-statement');
+        if (!fileInput.files || fileInput.files.length === 0) {
+            alert('Please select at least one statement file.');
+            return;
+        }
+
         uploadView.style.display = 'none';
         processingView.style.display = 'block';
 
         const formData = new FormData();
-        formData.append('bank_statement', document.getElementById('bank-statement').files[0]);
-        
+        for (let i = 0; i < fileInput.files.length; i++) {
+            formData.append('bank_statements', fileInput.files[i]);
+        }
+        formData.append('bank_statement', fileInput.files[0]);
 
         const note = document.getElementById('context-note').value;
         if (note) formData.append('context_note', note);
@@ -77,6 +144,7 @@ document.addEventListener('DOMContentLoaded', () => {
             if (result.status === 'success') {
                 dashboardData = result.data;
                 renderDashboard(dashboardData);
+                showToast(`Loaded ${result.total_count || ''} transactions successfully!`, 'success');
             } else {
                 alert('Error: ' + result.message);
                 resetView();
@@ -102,86 +170,218 @@ document.addEventListener('DOMContentLoaded', () => {
     let monthlyCategoryChartInstance = null;
     let needsWantsChartInstance = null;
 
+    function getSortedMonths(data) {
+        if (data.overview && data.overview.months_list && data.overview.months_list.length > 0) {
+            return [...data.overview.months_list];
+        }
+        const months = [...new Set(data.transactions.filter(t => t.month_year && t.month_year !== 'Unknown').map(t => t.month_year))];
+        months.sort((a, b) => new Date(a) - new Date(b));
+        return months;
+    }
+
+    function populateFilterDropdowns(data) {
+        const months = getSortedMonths(data);
+
+        // 1. Transactions filter month
+        const monthSelect = document.getElementById('filter-month');
+        if (monthSelect) {
+            const currentVal = monthSelect.value || 'All';
+            monthSelect.innerHTML = '<option value="All">All Months</option>';
+            months.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                monthSelect.appendChild(opt);
+            });
+            if (months.includes(currentVal)) {
+                monthSelect.value = currentVal;
+            } else {
+                monthSelect.value = 'All';
+            }
+        }
+
+        // 2. Category Explorer filter month
+        const catExplorerMonthSelect = document.getElementById('filter-cat-explorer-month');
+        if (catExplorerMonthSelect) {
+            const currentVal = catExplorerMonthSelect.value || 'All';
+            catExplorerMonthSelect.innerHTML = '<option value="All">All Months</option>';
+            months.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                catExplorerMonthSelect.appendChild(opt);
+            });
+            if (months.includes(currentVal)) {
+                catExplorerMonthSelect.value = currentVal;
+            } else {
+                catExplorerMonthSelect.value = 'All';
+            }
+        }
+
+        // 3. Transactions filter category
+        const catSelect = document.getElementById('filter-category');
+        if (catSelect && data.categories) {
+            const currentVal = catSelect.value || 'All';
+            catSelect.innerHTML = '<option value="All">All Categories</option>';
+            data.categories.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.name;
+                opt.textContent = c.name;
+                catSelect.appendChild(opt);
+            });
+            const catNames = data.categories.map(c => c.name);
+            if (catNames.includes(currentVal)) {
+                catSelect.value = currentVal;
+            } else {
+                catSelect.value = 'All';
+            }
+        }
+
+        // 4. Modal month select
+        const modalMonthSelect = document.getElementById('month-select');
+        if (modalMonthSelect) {
+            months.forEach(m => {
+                let exists = false;
+                for (let i = 0; i < modalMonthSelect.options.length; i++) {
+                    if (modalMonthSelect.options[i].value === m) exists = true;
+                }
+                if (!exists) {
+                    const opt = document.createElement('option');
+                    opt.value = m;
+                    opt.textContent = m;
+                    modalMonthSelect.appendChild(opt);
+                }
+            });
+        }
+    }
+
     function renderDashboard(data) {
+        dashboardData = data;
+        window.dashboardData = data;
         processingView.style.display = 'none';
         dashboardView.style.display = 'block';
         exportBtn.style.display = 'block';
         const clearBtn = document.getElementById('clear-session-btn');
         if (clearBtn) clearBtn.style.display = 'block';
 
-        renderOverview(data);
-        renderMonthlyTrends(data);
-        
+        const addBtn = document.getElementById('add-statement-btn');
+        if (addBtn) addBtn.style.display = 'inline-flex';
+
+        // 1. Update filter dropdown options FIRST so all views have all months
+        populateFilterDropdowns(data);
+
+        // 2. Update header dataset badge
+        const badge = document.getElementById('dataset-period-badge');
+        if (badge && data.overview) {
+            const o = data.overview;
+            const monthsCount = o.months_count || (o.months_list ? o.months_list.length : 1);
+            const periodStr = o.period_str ? ` (${o.period_str})` : '';
+            const txCount = o.tx_count || (data.transactions ? data.transactions.length : 0);
+            badge.style.display = 'inline-flex';
+            badge.innerHTML = `<span>📅</span> ${monthsCount} Months${periodStr} • ${txCount} txns`;
+        }
+
+        const safeRender = (name, fn) => { try { fn(); } catch(e) { console.error('[renderDashboard] ' + name + ' failed:', e); } };
+
+        safeRender('renderOverview', () => renderOverview(data));
+        safeRender('renderMonthlyCategoryChart', () => renderMonthlyCategoryChart(data));
+        safeRender('renderSpendInsights', () => renderSpendInsights(data));
+
         const catExpMonth = document.getElementById('filter-cat-explorer-month') ? document.getElementById('filter-cat-explorer-month').value : 'All';
-        renderCategoryExplorer(data, catExpMonth);
-        
-        setupTransactions(data);
-        renderTopFrequent(data);
-        renderNeedsWants(data);
-        renderSplits(data);
+        safeRender('renderCategoryExplorer', () => renderCategoryExplorer(data, catExpMonth));
+
+        safeRender('setupTransactions', () => setupTransactions(data));
+        safeRender('renderTopFrequent', () => renderTopFrequent(data));
+        safeRender('renderSplits', () => renderSplits(data));
+
+        // Restore active tab
+        const savedTab = localStorage.getItem('activeTab');
+        const validTabs = ['tab-overview','tab-monthly-breakdown','tab-insights','tab-category','tab-transactions','tab-splits','tab-top','tab-assistant'];
+        const defaultTab = (savedTab && validTabs.includes(savedTab)) ? savedTab : 'tab-overview';
+        activateTab(defaultTab, true);
     }
 
     function renderOverview(data) {
-        const o = data.overview;
-        document.getElementById('stat-balance').textContent = formatCurrency(o.closing_balance);
+        const o = data.overview || {};
         
-        // Reconciliation check
-        if (Math.abs(o.reconciliation_diff) > 0.01) {
-            document.getElementById('reconciliation-alert').style.display = 'block';
-            document.getElementById('reconciliation-msg').textContent = `Warning: The net computed from transactions differs from the statement balance change by ₹${o.reconciliation_diff}. Some transactions may have been missed or duplicated.`;
-        } else {
-            document.getElementById('reconciliation-alert').style.display = 'none';
-        }
+        const totalSpendEl = document.getElementById('stat-total-spend');
+        if (totalSpendEl) totalSpendEl.textContent = formatCurrency(o.total_spend || o.total_out || 0);
+
+        const avgSpendEl = document.getElementById('stat-avg-spend');
+        if (avgSpendEl) avgSpendEl.textContent = formatCurrency(o.avg_monthly_spend || 0);
+
+        const actualSpendEl = document.getElementById('stat-actual-spend');
+        if (actualSpendEl) actualSpendEl.textContent = formatCurrency(o.actual_spent || 0);
 
         // Investment Note
         const invNote = document.getElementById('investment-note');
-        if (o.investments_total > 0) {
-            invNote.style.display = 'block';
-            document.getElementById('investment-note-msg').innerHTML = `
-                Your total outflow was <strong>${formatCurrency(o.total_out)}</strong>. <br>
-                However, <strong>${formatCurrency(o.investments_total)}</strong> of that was moved into <strong>Investments</strong>. <br>
-                Therefore, your actual total spent is <strong style="color:var(--text); font-size:1.1rem;">${formatCurrency(o.actual_spent)}</strong>.
-            `;
-        } else {
-            invNote.style.display = 'none';
+        if (invNote) {
+            if (o.investments_total > 0) {
+                invNote.style.display = 'block';
+                const invMsg = document.getElementById('investment-note-msg');
+                if (invMsg) {
+                    invMsg.innerHTML = `
+                        Your total outflow was <strong>${formatCurrency(o.total_spend || o.total_out || 0)}</strong>. <br>
+                        However, <strong>${formatCurrency(o.investments_total)}</strong> of that was moved into <strong>Investments</strong>. <br>
+                        Therefore, your actual total spent is <strong style="color:var(--text); font-size:1.1rem;">${formatCurrency(o.actual_spent || 0)}</strong>.
+                    `;
+                }
+            } else {
+                invNote.style.display = 'none';
+            }
         }
 
         // Top 5 Categories & Insights
         const catList = document.getElementById('top-categories-list');
-        catList.innerHTML = '';
-        data.categories.slice(0, 5).forEach(cat => {
-            const li = document.createElement('li');
-            li.innerHTML = `
-                <div>
-                    <span style="display:block; font-weight:600;">${cat.name}</span>
-                    <span style="font-size:0.8rem; color:var(--text-muted);">${cat.insight}</span>
-                </div>
-                <span style="font-weight:700;">${formatCurrency(cat.amount)}</span>
-            `;
-            catList.appendChild(li);
-        });
+        if (catList && data.categories) {
+            catList.innerHTML = '';
+            data.categories.slice(0, 5).forEach(cat => {
+                const li = document.createElement('li');
+                li.innerHTML = `
+                    <div>
+                        <span style="display:block; font-weight:600;">${cat.name}</span>
+                        <span style="font-size:0.8rem; color:var(--text-muted);">${cat.insight}</span>
+                    </div>
+                    <span style="font-weight:700;">${formatCurrency(cat.amount)}</span>
+                `;
+                catList.appendChild(li);
+            });
+        }
 
-        // Verdicts
+        // Verdicts (Spend only)
         const verdictsContainer = document.getElementById('month-verdicts-container');
-        verdictsContainer.innerHTML = '';
-        const verdicts = data.month_verdicts || {};
-        Object.keys(verdicts).sort((a, b) => new Date(a) - new Date(b)).forEach(month => {
-            const v = verdicts[month];
-            const div = document.createElement('div');
-            div.className = 'verdict-card';
-            const colorClass = v.net >= 0 ? 'positive' : 'negative';
-            div.innerHTML = `
-                <div class="verdict-month">${month}</div>
-                <div class="verdict-net" style="color: var(--${colorClass});">${formatCurrency(v.net)}</div>
-                <div class="verdict-reason">${v.reason}</div>
-            `;
-            verdictsContainer.appendChild(div);
-        });
+        if (verdictsContainer) {
+            verdictsContainer.innerHTML = '';
+            const verdicts = data.month_verdicts || {};
+            Object.keys(verdicts).sort((a, b) => new Date(a) - new Date(b)).forEach(month => {
+                const v = verdicts[month];
+                const div = document.createElement('div');
+                div.className = 'verdict-card';
+                const vsBadge = (v.vs_avg !== undefined) ? `
+                    <span style="font-size: 0.78rem; font-weight: 600; padding: 0.2rem 0.5rem; border-radius: 4px; background: ${v.vs_avg > 0 ? 'rgba(239, 68, 68, 0.15)' : 'rgba(16, 185, 129, 0.15)'}; color: ${v.vs_avg > 0 ? '#f87171' : '#34d399'};">
+                        ${v.vs_avg > 0 ? '▲ +' + v.vs_avg + '% vs avg' : (v.vs_avg < 0 ? '▼ ' + v.vs_avg + '% vs avg' : '~ at avg')}
+                    </span>
+                ` : '';
+                div.innerHTML = `
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem;">
+                        <span class="verdict-month" style="font-weight: 700; font-size: 1.1rem; color: var(--accent);">${month}</span>
+                        ${vsBadge}
+                    </div>
+                    <div style="margin-bottom: 0.5rem;">
+                        <span style="font-size: 0.8rem; color: var(--text-muted);">Month Spend:</span>
+                        <span style="color: var(--negative); font-weight: 700; font-size: 1.2rem; margin-left: 0.35rem;">${formatCurrency(v.spend || 0)}</span>
+                    </div>
+                    <div class="verdict-reason" style="font-size: 0.85rem; color: var(--text-muted); padding-top: 0.5rem; border-top: 1px solid rgba(255,255,255,0.1);">${v.reason}</div>
+                `;
+                verdictsContainer.appendChild(div);
+            });
+        }
     }
 
     function renderMonthlyTrends(data) {
+        if (!document.getElementById('monthlySpendChart')) return;
         const trends = data.monthly_trends;
-        const months = Object.keys(trends.spend).sort((a, b) => new Date(a) - new Date(b)); 
+        const months = getSortedMonths(data); 
         // Best to trust backend order or parse it. Let's trust backend order for now, it's usually chronological if we extract from statement top to bottom.
         
         // 1. Spend & Net line
@@ -227,7 +427,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         const month = months[index];
                         document.getElementById('filter-month').value = month;
                         filterTransactions();
-                        switchTab('tab-transactions');
+                        activateTab('tab-transactions');
                     }
                 },
                 scales: {
@@ -249,7 +449,8 @@ document.addEventListener('DOMContentLoaded', () => {
             datasets.push({
                 label: catName,
                 data: months.map(m => {
-                    const found = trends.categories[m].find(c => c.name === catName);
+                    const catList = (trends.categories && trends.categories[m]) ? trends.categories[m] : [];
+                    const found = catList.find(c => c.name === catName);
                     return found ? found.amount : 0;
                 }),
                 backgroundColor: colors[index],
@@ -262,7 +463,8 @@ document.addEventListener('DOMContentLoaded', () => {
             label: 'Other',
             data: months.map(m => {
                 let sum = 0;
-                trends.categories[m].forEach(c => {
+                const catList = (trends.categories && trends.categories[m]) ? trends.categories[m] : [];
+                catList.forEach(c => {
                     if (!top6.includes(c.name)) sum += c.amount;
                 });
                 return sum;
@@ -303,7 +505,186 @@ document.addEventListener('DOMContentLoaded', () => {
                         }
                         
                         filterTransactions();
-                        switchTab('tab-transactions');
+                        activateTab('tab-transactions');
+                    }
+                }
+            }
+        });
+    }
+
+
+    let catExplorerPieInstance = null;
+
+    window.renderMonthlyCategoryChart = renderMonthlyCategoryChart;
+    function renderMonthlyCategoryChart(data) {
+        const catCanvas = document.getElementById('monthlyCategoryChart');
+        if (!catCanvas) return;
+        const catCtx = catCanvas.getContext('2d');
+        if (monthlyCategoryChartInstance) {
+            monthlyCategoryChartInstance.destroy();
+            monthlyCategoryChartInstance = null;
+        }
+
+        const trends = data.monthly_trends || {};
+        const months = getSortedMonths(data);
+        if (!months || months.length === 0) return;
+
+        // Top 7 categories overall
+        const top7 = (data.categories || []).slice(0, 7).map(c => c.name);
+        
+        const palette = [
+            '#8b5cf6', // Violet (Investments)
+            '#ec4899', // Pink / Rose (Rent)
+            '#10b981', // Emerald (Groceries)
+            '#f59e0b', // Amber (Food & Dining)
+            '#3b82f6', // Blue (Shopping)
+            '#06b6d4', // Cyan (Transport)
+            '#f43f5e', // Coral (Fun)
+            '#64748b'  // Slate (Other)
+        ];
+
+        const datasets = [];
+        top7.forEach((catName, index) => {
+            datasets.push({
+                label: catName,
+                data: months.map(m => {
+                    const catList = (trends.categories && trends.categories[m]) ? trends.categories[m] : [];
+                    const found = catList.find(c => c.name === catName);
+                    return found ? found.amount : 0;
+                }),
+                backgroundColor: palette[index % palette.length],
+                borderRadius: 3,
+                borderWidth: 0
+            });
+        });
+
+        // Misc (aggregated other categories) bucket
+        datasets.push({
+            label: 'Misc',
+            data: months.map(m => {
+                let sum = 0;
+                const catList = (trends.categories && trends.categories[m]) ? trends.categories[m] : [];
+                catList.forEach(c => {
+                    if (!top7.includes(c.name)) sum += c.amount;
+                });
+                return sum;
+            }),
+            backgroundColor: palette[7],
+            borderRadius: 3,
+            borderWidth: 0
+        });
+
+        monthlyCategoryChartInstance = new Chart(catCtx, {
+            type: 'bar',
+            data: { labels: months, datasets: datasets },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: {
+                        stacked: true,
+                        grid: { display: false },
+                        ticks: { color: '#94a3b8', font: { weight: 600 } }
+                    },
+                    y: {
+                        stacked: true,
+                        grid: { color: 'rgba(255,255,255,0.06)' },
+                        ticks: {
+                            color: '#94a3b8',
+                            callback: value => '₹' + (value >= 1000 ? (value / 1000).toFixed(0) + 'k' : value)
+                        }
+                    }
+                },
+                plugins: {
+                    legend: {
+                        position: 'bottom',
+                        labels: { color: '#f1f5f9', padding: 12, boxWidth: 12, usePointStyle: true }
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(context) {
+                                return ` ${context.dataset.label}: ₹${Number(context.raw).toLocaleString('en-IN')}`;
+                            },
+                            footer: function(tooltipItems) {
+                                let total = 0;
+                                tooltipItems.forEach(item => { total += item.raw; });
+                                return ` Total Month Spend: ₹${Number(total).toLocaleString('en-IN')}`;
+                            }
+                        }
+                    }
+                },
+                onClick: (e, elements) => {
+                    if (elements.length > 0) {
+                        const el = elements[0];
+                        const month = months[el.index];
+                        const categoryName = datasets[el.datasetIndex].label;
+
+                        const filterMonth = document.getElementById('filter-month');
+                        const filterCat = document.getElementById('filter-category');
+                        if (filterMonth) filterMonth.value = month;
+                        if (filterCat) {
+                            filterCat.value = (categoryName !== 'Misc' && categoryName !== 'Other') ? categoryName : 'All';
+                        }
+                        if (window.filterTransactions) window.filterTransactions();
+                        activateTab('tab-transactions');
+                    }
+                }
+            }
+        });
+    }
+
+    function renderCategoryExplorerPie(catsToRender) {
+        const canvas = document.getElementById('categoryExplorerPieChart');
+        if (!canvas) return;
+        const ctx = canvas.getContext('2d');
+        if (catExplorerPieInstance) {
+            catExplorerPieInstance.destroy();
+            catExplorerPieInstance = null;
+        }
+
+        const topCats = catsToRender.slice(0, 6);
+        const otherAmt = catsToRender.slice(6).reduce((s, c) => s + c.amount, 0);
+        
+        const labels = topCats.map(c => c.name);
+        const dataVals = topCats.map(c => c.amount);
+        if (otherAmt > 0) {
+            labels.push('Misc');
+            dataVals.push(otherAmt);
+        }
+
+        const colors = [
+            '#8b5cf6', '#ec4899', '#10b981', '#f59e0b', 
+            '#3b82f6', '#06b6d4', '#64748b'
+        ];
+
+        catExplorerPieInstance = new Chart(ctx, {
+            type: 'doughnut',
+            data: {
+                labels: labels,
+                datasets: [{
+                    data: dataVals,
+                    backgroundColor: colors.slice(0, labels.length),
+                    borderWidth: 2,
+                    borderColor: '#0f172a'
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        position: 'right',
+                        labels: { color: '#f1f5f9', font: { size: 11 }, boxWidth: 12, usePointStyle: true }
+                    },
+                    tooltip: {
+                        callbacks: {
+                            label: function(ctx) {
+                                const val = ctx.raw;
+                                const total = ctx.dataset.data.reduce((a, b) => a + b, 0);
+                                const pct = total > 0 ? ((val / total) * 100).toFixed(1) : 0;
+                                return ` ${ctx.label}: ₹${Number(val).toLocaleString('en-IN')} (${pct}%)`;
+                            }
+                        }
                     }
                 }
             }
@@ -312,6 +693,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderCategoryExplorer(data, selectedMonth = 'All') {
         const tbody = document.querySelector('#category-explorer-table tbody');
+        if (!tbody) return;
         tbody.innerHTML = '';
         
         let catsToRender = [];
@@ -319,7 +701,7 @@ document.addEventListener('DOMContentLoaded', () => {
             catsToRender = data.categories;
         } else {
             // Compute monthly categories with count and average
-            const monthTxs = data.transactions.filter(t => t.month_year === selectedMonth && t.type === 'Debit');
+            const monthTxs = data.transactions.filter(t => t.month_year === selectedMonth && t.type === 'Debit' && t.category !== 'Ignored/Refund');
             const totalOut = monthTxs.reduce((sum, t) => sum + t.amount, 0);
             
             const catMap = {};
@@ -338,22 +720,49 @@ document.addEventListener('DOMContentLoaded', () => {
         
         catsToRender.forEach(cat => {
             const tr = document.createElement('tr');
-            tr.style.cursor = 'pointer';
             tr.innerHTML = `
-                <td>${cat.name}</td>
-                <td style="font-weight:600;">${formatCurrency(cat.amount)}</td>
-                <td>${cat.count}</td>
-                <td>${formatCurrency(cat.amount / cat.count)}</td>
-                <td>${cat.percent}%</td>
+                <td style="text-align: center;"><input type="checkbox" class="cat-explorer-checkbox" data-amount="${cat.amount}" checked></td>
+                <td style="cursor: pointer;" class="cat-clickable">${cat.name}</td>
+                <td style="cursor: pointer; font-weight:600;" class="cat-clickable">${formatCurrency(cat.amount)}</td>
+                <td style="cursor: pointer;" class="cat-clickable">${cat.count}</td>
+                <td style="cursor: pointer;" class="cat-clickable">${formatCurrency(cat.amount / cat.count)}</td>
+                <td style="cursor: pointer;" class="cat-clickable">${cat.percent}%</td>
             `;
-            tr.addEventListener('click', () => {
-                document.getElementById('filter-month').value = selectedMonth;
-                document.getElementById('filter-category').value = cat.name;
-                filterTransactions();
-                switchTab('tab-transactions');
+            
+            tr.querySelector('.cat-explorer-checkbox').addEventListener('change', updateCatExplorerTotal);
+            
+            tr.querySelectorAll('.cat-clickable').forEach(el => {
+                el.addEventListener('click', () => {
+                    document.getElementById('filter-month').value = selectedMonth;
+                    document.getElementById('filter-category').value = cat.name;
+                    filterTransactions();
+                    activateTab('tab-transactions');
+                });
             });
             tbody.appendChild(tr);
         });
+
+        updateCatExplorerTotal();
+        renderCategoryExplorerPie(catsToRender);
+        
+        const selectAll = document.getElementById('cat-explore-select-all');
+        if (selectAll) {
+            selectAll.checked = true;
+            selectAll.onclick = function() {
+                document.querySelectorAll('.cat-explorer-checkbox').forEach(cb => cb.checked = this.checked);
+                updateCatExplorerTotal();
+        renderCategoryExplorerPie(catsToRender);
+            };
+        }
+    }
+    
+    function updateCatExplorerTotal() {
+        let total = 0;
+        document.querySelectorAll('.cat-explorer-checkbox').forEach(cb => {
+            if (cb.checked) total += parseFloat(cb.dataset.amount);
+        });
+        const totalEl = document.getElementById('cat-explorer-total');
+        if (totalEl) totalEl.textContent = formatCurrency(total);
     }
 
     let filteredTxs = [];
@@ -376,43 +785,166 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
     
+
+    // --- SPEND INTELLIGENCE & INSIGHTS ---
+    let fixedVsVarPieInstance = null;
+    let spendVelocityChartInstance = null;
+
+    window.renderSpendInsights = renderSpendInsights;
+    function renderSpendInsights(data) {
+        if (!data || !data.insights) return;
+        const ins = data.insights;
+
+        // 1. Category Surge / Spike Alerts
+        const spikeContainer = document.getElementById('insights-spike-container');
+        if (spikeContainer) {
+            spikeContainer.innerHTML = '';
+            const alerts = ins.spike_alerts || [];
+            if (alerts.length === 0) {
+                spikeContainer.innerHTML = '<div style="color:var(--text-muted); font-size:0.85rem; padding:0.5rem 0;">No abnormal category surges detected. All categories are tracking near historical averages.</div>';
+            } else {
+                alerts.slice(0, 8).forEach(a => {
+                    const card = document.createElement('div');
+                    card.style.cssText = 'background: rgba(239, 68, 68, 0.08); border-left: 3px solid var(--negative); padding: 0.5rem 0.75rem; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;';
+                    card.innerHTML = `
+                        <div>
+                            <div style="font-weight: 600; font-size: 0.88rem; color: #f8fafc;">
+                                <span>${a.category}</span>
+                                <span style="font-size: 0.75rem; color: var(--accent); margin-left: 0.4rem; padding: 0.1rem 0.4rem; background: rgba(139,92,246,0.2); border-radius: 4px;">${a.month}</span>
+                            </div>
+                            <div style="font-size: 0.78rem; color: var(--text-muted); margin-top: 2px;">
+                                Spent <strong>${formatCurrency(a.amount)}</strong> (Monthly avg: ${formatCurrency(a.avg)})
+                            </div>
+                        </div>
+                        <span style="font-size: 0.8rem; font-weight: 700; color: #f87171; background: rgba(239,68,68,0.15); padding: 0.2rem 0.5rem; border-radius: 4px; white-space: nowrap;">
+                            ▲ +${a.pct_change}%
+                        </span>
+                    `;
+                    spikeContainer.appendChild(card);
+                });
+            }
+        }
+
+        // 3. Fixed Baseline vs. Controllable (Discretionary) Spend
+        const fv = ins.fixed_vs_variable || {};
+        const fixedPctEl = document.getElementById('insights-fixed-pct');
+        if (fixedPctEl) fixedPctEl.textContent = `${fv.fixed_pct || 0}%`;
+
+        const fixedAmtEl = document.getElementById('insights-fixed-amt');
+        if (fixedAmtEl) fixedAmtEl.textContent = `${formatCurrency(fv.fixed_total || 0)} (~${formatCurrency(fv.fixed_monthly || 0)}/mo)`;
+
+        const controlPctEl = document.getElementById('insights-control-pct');
+        if (controlPctEl) controlPctEl.textContent = `${fv.control_pct || 0}%`;
+
+        const controlAmtEl = document.getElementById('insights-control-amt');
+        if (controlAmtEl) controlAmtEl.textContent = `${formatCurrency(fv.control_total || 0)} (~${formatCurrency(fv.control_monthly || 0)}/mo)`;
+
+        // Pie chart for Fixed vs Variable
+        const fvCanvas = document.getElementById('fixedVsVariablePieChart');
+        if (fvCanvas) {
+            if (fixedVsVarPieInstance) {
+                fixedVsVarPieInstance.destroy();
+                fixedVsVarPieInstance = null;
+            }
+            fixedVsVarPieInstance = new Chart(fvCanvas.getContext('2d'), {
+                type: 'doughnut',
+                data: {
+                    labels: ['Fixed Commitments', 'Lifestyle / Controllable'],
+                    datasets: [{
+                        data: [fv.fixed_total || 0, fv.control_total || 0],
+                        backgroundColor: ['#8b5cf6', '#38bdf8'],
+                        borderWidth: 2,
+                        borderColor: '#0f172a'
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: ctx => ` ${ctx.label}: ₹${Number(ctx.raw).toLocaleString('en-IN')}`
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        
+        // 5. Spend Velocity Curve (Day 1 to 31)
+        const velCanvas = document.getElementById('spendVelocityChart');
+        if (velCanvas && ins.spend_velocity) {
+            if (spendVelocityChartInstance) {
+                spendVelocityChartInstance.destroy();
+                spendVelocityChartInstance = null;
+            }
+            const days = Array.from({ length: 31 }, (_, i) => `Day ${i + 1}`);
+            const velColors = ['#8b5cf6', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#06b6d4', '#f43f5e', '#a855f7'];
+            const velDatasets = Object.keys(ins.spend_velocity).map((m, idx) => ({
+                label: m,
+                data: ins.spend_velocity[m],
+                borderColor: velColors[idx % velColors.length],
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 1,
+                pointHoverRadius: 5,
+                tension: 0.25
+            }));
+
+            spendVelocityChartInstance = new Chart(velCanvas.getContext('2d'), {
+                type: 'line',
+                data: { labels: days, datasets: velDatasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            grid: { color: 'rgba(255,255,255,0.04)' },
+                            ticks: { color: '#94a3b8', maxTicksLimit: 16 }
+                        },
+                        y: {
+                            grid: { color: 'rgba(255,255,255,0.06)' },
+                            ticks: {
+                                color: '#94a3b8',
+                                callback: val => '₹' + (val >= 1000 ? (val / 1000).toFixed(0) + 'k' : val)
+                            }
+                        }
+                    },
+                    plugins: {
+                        legend: {
+                            position: 'bottom',
+                            labels: { color: '#f1f5f9', padding: 12, boxWidth: 12, usePointStyle: true }
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: ctx => ` ${ctx.dataset.label} (${ctx.label}): ₹${Number(ctx.raw).toLocaleString('en-IN')}`
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        
+    }
+
     function setupTransactions(data) {
         filteredTxs = [...data.transactions];
         
-        const monthSelect = document.getElementById('filter-month');
-        const catSelect = document.getElementById('filter-category');
-        const catExplorerMonthSelect = document.getElementById('filter-cat-explorer-month');
-        const debitsMonthSelect = document.getElementById('filter-debits-month');
-        const debitsCatSelect = document.getElementById('filter-debits-category');
-        
         if (!filtersInitialized) {
-            // Clear before populating
-            if (monthSelect) monthSelect.innerHTML = '<option value="All">All Months</option>';
-            if (catExplorerMonthSelect) catExplorerMonthSelect.innerHTML = '<option value="All">All Months</option>';
-            if (catSelect) catSelect.innerHTML = '<option value="All">All Categories</option>';
-
-            // Populate filters
-            const months = [...new Set(data.transactions.filter(t => t.month_year && t.month_year !== 'Unknown').map(t => t.month_year))];
-            months.sort((a, b) => new Date(a) - new Date(b));
-            months.forEach(m => {
-                const opt1 = document.createElement('option'); opt1.value = m; opt1.textContent = m;
-                if (monthSelect) monthSelect.appendChild(opt1);
-                const opt2 = document.createElement('option'); opt2.value = m; opt2.textContent = m;
-                if (catExplorerMonthSelect) catExplorerMonthSelect.appendChild(opt2);
-            });
-
-            data.categories.forEach(c => {
-                const opt = document.createElement('option');
-                opt.value = c.name; opt.textContent = c.name;
-                if (catSelect) catSelect.appendChild(opt);
-            });
-            
-            if (catExplorerMonthSelect) catExplorerMonthSelect.addEventListener('change', (e) => {
-                renderCategoryExplorer(dashboardData, e.target.value);
-            });
+            const catExplorerMonthSelect = document.getElementById('filter-cat-explorer-month');
+            if (catExplorerMonthSelect) {
+                catExplorerMonthSelect.addEventListener('change', (e) => {
+                    renderCategoryExplorer(dashboardData, e.target.value);
+                });
+            }
         
             // Listeners for All Transactions
             const typeSelect = document.getElementById('filter-type');
+            const monthSelect = document.getElementById('filter-month');
+            const catSelect = document.getElementById('filter-category');
             if (typeSelect) typeSelect.addEventListener('change', filterTransactions);
             if (monthSelect) monthSelect.addEventListener('change', filterTransactions);
             if (catSelect) catSelect.addEventListener('change', filterTransactions);
@@ -470,7 +1002,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const matchS = s === '' || tx.merchant.toLowerCase().includes(s) || (tx.note && tx.note.toLowerCase().includes(s));
             
             if (matchT && matchM && matchC && matchS) {
-                if (tx.category !== 'Ignored/Refund' && tx.category !== 'Family/Self Transfer') {
+                if (tx.category !== 'Ignored/Refund') {
                     if (tx.type === 'Debit') {
                         totalDebits += tx.amount;
                     } else {
@@ -574,6 +1106,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <td class="${typeClass}" style="font-weight:600;">${formatCurrency(tx.amount)}</td>
                 <td>
                     ${tx.type === 'Debit' ? `<button class="btn-primary" style="padding: 2px 6px; font-size: 0.75rem;" onclick="splitTransaction('${tx.tx_id}', ${tx.amount})">Split ✂️</button>` : ''}
+                    <button class="btn-primary" style="padding: 2px 6px; font-size: 0.75rem; background: var(--accent); margin-left: 5px;" onclick="askAITransaction('${tx.merchant.replace(/'/g, "\\'")}', ${tx.amount}, '${tx.date}')">Ask AI 🤖</button>
                 </td>
             `;
 
@@ -608,279 +1141,24 @@ document.addEventListener('DOMContentLoaded', () => {
     function renderTopFrequent(data) {
         // Top 15
         const t15 = document.querySelector('#top-15-table tbody');
-        t15.innerHTML = '';
-        data.top_15_overall.forEach(tx => {
-            t15.innerHTML += `<tr><td>${tx.date}</td><td>${tx.merchant}</td><td>${tx.category}</td><td class="debit">${formatCurrency(tx.amount)}</td></tr>`;
-        });
+        if (t15 && data.top_15_overall) {
+            t15.innerHTML = '';
+            data.top_15_overall.forEach(tx => {
+                t15.innerHTML += `<tr><td>${tx.date}</td><td>${tx.merchant}</td><td>${tx.category}</td><td class="debit">${formatCurrency(tx.amount)}</td></tr>`;
+            });
+        }
         
         // Frequent
         const freq = document.querySelector('#frequent-table tbody');
-        freq.innerHTML = '';
-        data.top_frequent.forEach(f => {
-            freq.innerHTML += `<tr><td>${f.merchant}</td><td>${f.count}</td><td>${formatCurrency(f.amount)}</td></tr>`;
-        });
+        if (freq && data.top_frequent) {
+            freq.innerHTML = '';
+            data.top_frequent.forEach(f => {
+                freq.innerHTML += `<tr><td>${f.merchant}</td><td>${f.count}</td><td>${formatCurrency(f.amount)}</td></tr>`;
+            });
+        }
     }
 
-    function renderNeedsWants(data) {
-        const trends = data.monthly_trends;
-        const months = Object.keys(trends.spend).sort((a, b) => new Date(a) - new Date(b));
-        
-        const nwKeys = ['Need', 'Want', 'Save/Invest', 'Neutral'];
-        const colors = ['#3b82f6', '#f59e0b', '#10b981', '#64748b'];
-        
-        const datasets = nwKeys.map((k, i) => {
-            return {
-                label: k,
-                data: months.map(m => trends.needs_wants[m][k] || 0),
-                backgroundColor: colors[i],
-                borderWidth: 0
-            };
-        });
-
-        const ctx = document.getElementById('needsWantsChart').getContext('2d');
-        if (needsWantsChartInstance) needsWantsChartInstance.destroy();
-        
-        needsWantsChartInstance = new Chart(ctx, {
-            type: 'bar',
-            data: { labels: months, datasets: datasets },
-            options: {
-                responsive: true, maintainAspectRatio: false,
-                scales: {
-                    x: { stacked: true, grid: { display: false }, ticks: { color: '#94a3b8' } },
-                    y: { stacked: true, grid: { color: 'rgba(255,255,255,0.1)' }, ticks: { color: '#94a3b8' } }
-                },
-                plugins: { legend: { labels: { color: '#f1f5f9' } } }
-            }
-        });
-        
-        // Compute overall Wants percentage for callout
-        let totalWants = 0, totalSpend = 0;
-        months.forEach(m => {
-            totalWants += trends.needs_wants[m]['Want'] || 0;
-            totalSpend += trends.spend[m] || 0;
-        });
-        
-        const wantsPct = totalSpend > 0 ? (totalWants / totalSpend) * 100 : 0;
-        const twentyPctCut = totalWants * 0.2 / (months.length || 1); // monthly average cut
-        
-        document.getElementById('needs-wants-callout').innerHTML = `
-            <strong>Insight:</strong> Wants make up ${wantsPct.toFixed(1)}% of your total spend. 
-            A 20% cut in discretionary spending would save you ~<strong>${formatCurrency(twentyPctCut)}/month</strong>.
-        `;
-    }
-
-    // Modal Logic
-    const modal = document.getElementById('misc-modal');
-    let currentEditCatTxId = null;
-    window.openMiscModal = function(merchantName, txId) {
-        document.getElementById('misc-merchant-name').textContent = merchantName;
-        currentEditCatTxId = txId || null;
-        modal.style.display = 'block';
-    }
-    document.getElementById('close-modal').onclick = () => modal.style.display = 'none';
-    window.onclick = (e) => { if (e.target == modal) modal.style.display = 'none'; }
-    
-    document.getElementById('misc-save-btn').onclick = async () => {
-        const newCat = document.getElementById('misc-category-select').value;
-        const merchant = document.getElementById('misc-merchant-name').textContent;
-        const miscSaveBtn = document.getElementById('misc-save-btn');
-        const modal = document.getElementById('misc-modal');
-        
-        // Update local state first
-        dashboardData.transactions.forEach(t => {
-            if (t.merchant === merchant) {
-                t.category = newCat;
-            }
-        });
-        
-        modal.style.display = 'none';
-        
-        try {
-            // Save merchant-level mapping (for future uploads)
-            await fetch('/api/mapping', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ merchant: merchant, category: newCat })
-            });
-            
-            // Save per-transaction override (for this specific transaction permanently)
-            if (currentEditCatTxId) {
-                await fetch('/api/tx-override', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ tx_id: currentEditCatTxId, field: 'category', value: newCat })
-                });
-            }
-            
-            miscSaveBtn.textContent = 'Recalculating...';
-            const response = await fetch('/api/recalculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ transactions: dashboardData.transactions })
-            });
-            const resData = await response.json();
-            if (resData.status === 'success') {
-                dashboardData = resData.data;
-                filterTransactions();
-                renderDashboard(dashboardData);
-            }
-        } catch(e) {
-            console.error(e);
-        } finally {
-            miscSaveBtn.textContent = 'Save Category';
-        }
-    };
-    
-    // Month Modal Logic
-    const monthModal = document.getElementById('month-modal');
-    const closeMonthModal = document.getElementById('close-month-modal');
-    const monthSaveBtn = document.getElementById('month-save-btn');
-    const monthSelect = document.getElementById('month-select');
-    let currentEditTxId = null;
-
-    window.openMonthModal = function(tx_id, dateStr, currentMonth) {
-        currentEditTxId = tx_id;
-        document.getElementById('month-tx-info').textContent = 'Date: ' + dateStr;
-        
-        let exists = false;
-        for (let i = 0; i < monthSelect.options.length; i++) {
-            if (monthSelect.options[i].value === currentMonth) exists = true;
-        }
-        if (!exists && currentMonth) {
-            const opt = document.createElement('option');
-            opt.value = currentMonth;
-            opt.textContent = currentMonth;
-            monthSelect.appendChild(opt);
-        }
-        
-        monthSelect.value = currentMonth || '';
-        monthModal.style.display = 'block';
-    };
-
-    if (closeMonthModal) closeMonthModal.onclick = () => { monthModal.style.display = 'none'; };
-    
-    if (monthSaveBtn) monthSaveBtn.onclick = async () => {
-        const newMonth = monthSelect.value;
-        monthModal.style.display = 'none';
-        
-        if (!currentEditTxId) return;
-        
-        // Update in memory
-        const tx = dashboardData.transactions.find(t => t.tx_id === currentEditTxId);
-        if (tx) {
-            tx.month_year = newMonth;
-        }
-        
-        // Recalculate
-        try {
-            monthSaveBtn.textContent = 'Saving...';
-            // Persist month override so it survives re-uploads
-            await fetch('/api/tx-override', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ tx_id: currentEditTxId, field: 'month_year', value: newMonth })
-            });
-            const response = await fetch('/api/recalculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ transactions: dashboardData.transactions })
-            });
-            const resData = await response.json();
-            if (resData.status === 'success') {
-                dashboardData = resData.data;
-                filterTransactions();
-                renderDashboard(dashboardData);
-            } else {
-                alert('Recalculation failed');
-            }
-        } catch(e) {
-            alert('Failed to reach backend');
-        } finally {
-            monthSaveBtn.textContent = 'Save Month';
-        }
-    };
-
-
-    // Split Logic
-    window.splitTransaction = async function(txId, currentAmount) {
-        const newAmount = prompt(`This transaction is currently ₹${currentAmount}.\n\nEnter YOUR actual share (e.g. 680):`);
-        if (newAmount === null || newAmount.trim() === '') return;
-        
-        const amountNum = parseFloat(newAmount);
-        if (isNaN(amountNum) || amountNum < 0) {
-            alert('Invalid amount');
-            return;
-        }
-
-        // Apply override locally
-        const tx = dashboardData.transactions.find(t => t.tx_id === txId);
-        if (tx) {
-            tx.original_amount = tx.original_amount || tx.amount; // Store original
-            tx.amount = amountNum;
-        }
-
-        try {
-            await fetch('/api/tx-override', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ tx_id: txId, field: 'amount', value: amountNum })
-            });
-            // Also store original amount if it's the first time
-            if (tx && tx.original_amount) {
-                await fetch('/api/tx-override', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ tx_id: txId, field: 'original_amount', value: tx.original_amount })
-                });
-            }
-
-            const response = await fetch('/api/recalculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ transactions: dashboardData.transactions })
-            });
-            const resData = await response.json();
-            if (resData.status === 'success') {
-                dashboardData = resData.data;
-                filterTransactions();
-                renderDashboard(dashboardData);
-                alert('Transaction updated! NOTE: If your friends send you money back for this, mark their payments as "Ignored/Refund" so they don\'t count twice.');
-            }
-        } catch(e) {
-            console.error(e);
-            alert('Failed to update amount');
-        }
-    };
-
-    window.resetSplit = async function(txId, originalAmount) {
-        if (!confirm('Restore original amount?')) return;
-        try {
-            await fetch('/api/tx-override', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ tx_id: txId, field: 'amount', value: originalAmount })
-            });
-            
-            const tx = dashboardData.transactions.find(t => t.tx_id === txId);
-            if (tx) tx.amount = originalAmount;
-            
-            const response = await fetch('/api/recalculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ transactions: dashboardData.transactions })
-            });
-            const resData = await response.json();
-            if (resData.status === 'success') {
-                dashboardData = resData.data;
-                filterTransactions();
-                renderDashboard(dashboardData);
-            }
-        } catch(e) {
-            console.error(e);
-        }
-    };
-
-    function renderSplits(data) {
+        function renderSplits(data) {
         const tbody = document.querySelector('#splits-table tbody');
         if (!tbody) return;
         tbody.innerHTML = '';
@@ -970,10 +1248,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     history: chatHistory,
                     context_data: {
                         overview: dashboardData.overview,
+                        transactions: dashboardData.transactions,
                         top_transactions: dashboardData.top_15_overall,
                         categories: dashboardData.categories,
                         top_merchants: dashboardData.top_frequent,
-                        monthly_trends: dashboardData.monthly_trends
+                        monthly_trends: dashboardData.monthly_trends,
+                        month_verdicts: dashboardData.month_verdicts
                     }
                 })
             });
@@ -1002,6 +1282,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    window.askAITransaction = function(merchant, amount, date) {
+        const tabBtn = document.querySelector('.tab-btn[data-target="tab-assistant"]');
+        if (tabBtn) tabBtn.click();
+        chatInput.value = `I see a transaction for "${merchant}" of ₹${amount} on ${date}. What sort of recharge or payment could this be?`;
+        sendChatMessage();
+    };
+
     if (chatSendBtn) chatSendBtn.addEventListener('click', sendChatMessage);
     if (chatInput) chatInput.addEventListener('keypress', (e) => {
         if (e.key === 'Enter') sendChatMessage();
@@ -1013,6 +1300,147 @@ document.addEventListener('DOMContentLoaded', () => {
             if (confirm("Are you sure you want to clear your data and start over?")) {
                 await fetch('/api/clear-session', { method: 'POST' });
                 window.location.reload();
+            }
+        });
+    }
+
+    // --- Toast Notifications ---
+    function showToast(message, type = 'success') {
+        const container = document.getElementById('toast-container');
+        if (!container) return;
+        const toast = document.createElement('div');
+        toast.className = `toast toast-${type}`;
+        const icon = type === 'success' ? '✅' : (type === 'error' ? '⚠️' : 'ℹ️');
+        toast.innerHTML = `<span style="font-size:1.1rem;">${icon}</span> <span>${message}</span>`;
+        container.appendChild(toast);
+        setTimeout(() => {
+            toast.style.transition = 'opacity 0.4s ease, transform 0.4s ease';
+            toast.style.opacity = '0';
+            toast.style.transform = 'translateY(10px)';
+            setTimeout(() => toast.remove(), 400);
+        }, 5500);
+    }
+
+    // --- Add Statement / Append Month Modal Logic ---
+    const addStatementModal = document.getElementById('add-statement-modal');
+    const addStatementBtn = document.getElementById('add-statement-btn');
+    const closeAddModalBtn = document.getElementById('close-add-modal-btn');
+    const cancelAddModalBtn = document.getElementById('cancel-add-modal-btn');
+    const addStatementForm = document.getElementById('add-statement-form');
+
+    function openAddModal() {
+        if (!addStatementModal) return;
+        addStatementModal.style.display = 'flex';
+        
+        if (addStatementForm) addStatementForm.reset();
+        const fileList = document.getElementById('append-file-list');
+        if (fileList) {
+            fileList.style.display = 'none';
+            fileList.innerHTML = '';
+        }
+        const msg = document.getElementById('append-file-msg');
+        if (msg) {
+            msg.textContent = 'Choose statement file (PDF, Excel, CSV)';
+            msg.style.color = '';
+        }
+        const loadingState = document.getElementById('append-loading-state');
+        if (loadingState) loadingState.style.display = 'none';
+        if (addStatementForm) addStatementForm.style.display = 'block';
+
+        const activeText = document.getElementById('modal-active-text');
+        if (activeText && dashboardData && dashboardData.overview) {
+            const o = dashboardData.overview;
+            const count = o.months_count || (o.months_list ? o.months_list.length : 1);
+            const period = o.period_str ? ` (${o.period_str})` : '';
+            const txs = o.tx_count || (dashboardData.transactions ? dashboardData.transactions.length : 0);
+            activeText.textContent = `Active Analysis: ${count} Months${period} • ${txs} Transactions`;
+        }
+    }
+
+    function closeAddModal() {
+        if (addStatementModal) addStatementModal.style.display = 'none';
+    }
+
+    if (addStatementBtn) addStatementBtn.addEventListener('click', openAddModal);
+    if (closeAddModalBtn) closeAddModalBtn.addEventListener('click', closeAddModal);
+    if (cancelAddModalBtn) cancelAddModalBtn.addEventListener('click', closeAddModal);
+
+    // Any button with .open-add-modal-btn opens the modal
+    document.querySelectorAll('.open-add-modal-btn').forEach(btn => {
+        btn.addEventListener('click', openAddModal);
+    });
+
+    // Global document event delegation as a bulletproof fallback
+    document.addEventListener('click', (e) => {
+        const btn = e.target && e.target.closest && e.target.closest('.open-add-modal-btn, #add-statement-btn, .btn-add-statement');
+        if (btn) {
+            e.preventDefault();
+            openAddModal();
+        }
+    });
+
+    // Close on outside click
+    if (addStatementModal) {
+        addStatementModal.addEventListener('click', (e) => {
+            if (e.target === addStatementModal) closeAddModal();
+        });
+    }
+
+    window.openAddModal = openAddModal;
+    window.closeAddModal = closeAddModal;
+
+    // Append statement form submit
+    if (addStatementForm) {
+        addStatementForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const fileInput = document.getElementById('append-bank-statement');
+            if (!fileInput || !fileInput.files || fileInput.files.length === 0) {
+                alert('Please select at least one statement file.');
+                return;
+            }
+
+            const loadingState = document.getElementById('append-loading-state');
+            addStatementForm.style.display = 'none';
+            loadingState.style.display = 'block';
+
+            const formData = new FormData();
+            for (let i = 0; i < fileInput.files.length; i++) {
+                formData.append('bank_statements', fileInput.files[i]);
+            }
+            formData.append('bank_statement', fileInput.files[0]);
+
+            const note = document.getElementById('append-context-note').value;
+            if (note) formData.append('context_note', note);
+
+            try {
+                const response = await fetch('/api/append-statement', {
+                    method: 'POST',
+                    body: formData
+                });
+                const result = await response.json();
+                if (result.status === 'success') {
+                    dashboardData = result.data;
+                    renderDashboard(dashboardData);
+                    closeAddModal();
+
+                    const added = result.added_count;
+                    const total = result.total_count;
+                    const months = result.months_count;
+                    if (added === 0) {
+                        showToast(`No new transactions found — all transactions in the uploaded statement were already present in your dataset. No duplicates added.`, 'info');
+                    } else {
+                        showToast(`🎉 Added ${added} new transactions! You now have ${months} months (${total} total transactions) in your dashboard.`, 'success');
+                    }
+                } else {
+                    alert('Error: ' + result.message);
+                    addStatementForm.style.display = 'block';
+                    loadingState.style.display = 'none';
+                }
+            } catch (err) {
+                console.error(err);
+                alert('Failed to append statement. See console for details.');
+                addStatementForm.style.display = 'block';
+                loadingState.style.display = 'none';
             }
         });
     }

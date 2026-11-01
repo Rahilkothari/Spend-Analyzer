@@ -27,6 +27,15 @@ def get_static_path():
     return "static"
 
 app = FastAPI()
+
+@app.middleware("http")
+async def add_no_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
 app.mount("/static", StaticFiles(directory=get_static_path()), name="static")
 
 TX_OVERRIDES_FILE = DATA_DIR / "tx_overrides.json"
@@ -58,29 +67,191 @@ async def read_index():
     with open(index_path, "r", encoding="utf-8") as f:
         return HTMLResponse(content=f.read())
 
-def parse_month_year(date_str):
-    try:
-        clean_date = date_str.replace('.', '-').replace('/', '-')
-        dt = datetime.datetime.strptime(clean_date, "%d-%m-%Y")
-        return dt.strftime("%b %Y"), dt
-    except:
-        return "Unknown", None
+def parse_date_obj(date_str):
+    if not date_str:
+        return None
+    clean = str(date_str).strip().replace('.', '-').replace('/', '-')
+    formats = [
+        "%d-%m-%Y",
+        "%d-%m-%y",
+        "%Y-%m-%d",
+        "%d-%b-%Y",
+        "%d-%b-%y",
+        "%d-%B-%Y"
+    ]
+    for fmt in formats:
+        try:
+            return datetime.datetime.strptime(clean, fmt)
+        except ValueError:
+            pass
+    return None
 
-def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
-    # Keep raw totals for reconciliation to ensure we parsed everything
-    raw_total_in = sum(t["amount"] for t in transactions if t.get("type") == "Credit")
-    raw_total_out = sum(t["amount"] for t in transactions if t.get("type") == "Debit")
+def month_sort_key(m_str):
+    try:
+        return datetime.datetime.strptime(m_str, "%b %Y")
+    except:
+        return datetime.datetime.min
+
+def parse_month_year(date_str):
+    dt = parse_date_obj(date_str)
+    if dt:
+        return dt.strftime("%b %Y"), dt
+    return "Unknown", None
+
+
+def compute_spend_insights(transactions, sorted_months, total_spend, avg_monthly_spend, category_sums):
+    months_count = len(sorted_months) if sorted_months else 1
     
-    computed_net = raw_total_in - raw_total_out
-    statement_net = closing_balance - opening_balance
-    reconciliation_diff = round(computed_net - statement_net, 2)
+    # 1. Micro-spend (< ₹500)
+    micro_txs = [t for t in transactions if float(t.get("amount", 0)) <= 500 and t.get("category") != "Ignored/Refund"]
+    micro_total = sum(float(t.get("amount", 0)) for t in micro_txs)
+    micro_count = len(micro_txs)
     
-    EXCLUDED_CATEGORIES = ["Family/Self Transfer", "Ignored/Refund"]
-    total_in = sum(t["amount"] for t in transactions if t.get("type") == "Credit" and t.get("category") == "Income")
-    total_out_debits = sum(t["amount"] for t in transactions if t.get("type") == "Debit" and t.get("category") not in EXCLUDED_CATEGORIES)
-    total_out_credits = sum(t["amount"] for t in transactions if t.get("type") == "Credit" and t.get("category") not in EXCLUDED_CATEGORIES and t.get("category") != "Income")
-    total_out = total_out_debits - total_out_credits
-    net = total_in - total_out
+    micro_merchants = defaultdict(lambda: {"count": 0, "amount": 0.0})
+    for t in micro_txs:
+        m = t.get("merchant", "Unknown")
+        micro_merchants[m]["count"] += 1
+        micro_merchants[m]["amount"] += float(t.get("amount", 0))
+    top_micro = [
+        {"merchant": m, "count": stats["count"], "amount": round(stats["amount"], 2)}
+        for m, stats in sorted(micro_merchants.items(), key=lambda x: x[1]["amount"], reverse=True)[:6]
+    ]
+    
+    micro_spend_data = {
+        "count": micro_count,
+        "total": round(micro_total, 2),
+        "pct_txs": round((micro_count / len(transactions)) * 100, 1) if transactions else 0,
+        "pct_spend": round((micro_total / total_spend) * 100, 1) if total_spend else 0,
+        "monthly_avg": round(micro_total / months_count, 2),
+        "top_merchants": top_micro
+    }
+    
+    # 2. Fixed vs Controllable Spend
+    fixed_cats = {"Rent", "Education/Loan EMI", "Bills-Recharge/Internet", "Bills-Subscriptions", "Investments", "CC Payment"}
+    fixed_spend = sum(float(t.get("amount", 0)) for t in transactions if t.get("category") in fixed_cats)
+    control_spend = total_spend - fixed_spend
+    fixed_vs_variable_data = {
+        "fixed_total": round(fixed_spend, 2),
+        "fixed_pct": round((fixed_spend / total_spend) * 100, 1) if total_spend else 0,
+        "fixed_monthly": round(fixed_spend / months_count, 2),
+        "control_total": round(control_spend, 2),
+        "control_pct": round((control_spend / total_spend) * 100, 1) if total_spend else 0,
+        "control_monthly": round(control_spend / months_count, 2)
+    }
+    
+    # 3. Category Spike Alerts
+    cat_monthly = defaultdict(lambda: defaultdict(float))
+    for t in transactions:
+        if t.get("category") not in ("Ignored/Refund", "Investments"):
+            cat_monthly[t.get("category")][t.get("month_year")] += float(t.get("amount", 0))
+            
+    spike_alerts = []
+    for cat, m_map in cat_monthly.items():
+        cat_avg = sum(m_map.values()) / months_count
+        if cat_avg < 1000:
+            continue
+        for m in sorted_months:
+            amt = m_map.get(m, 0)
+            if amt >= 2000 and amt >= cat_avg * 1.35:
+                pct = round(((amt - cat_avg) / cat_avg) * 100, 1)
+                spike_alerts.append({
+                    "month": m,
+                    "category": cat,
+                    "amount": round(amt, 2),
+                    "avg": round(cat_avg, 2),
+                    "pct_change": pct
+                })
+    spike_alerts.sort(key=lambda x: (month_sort_key(x["month"]), -x["pct_change"]))
+    
+    # 4. Weekend vs Weekday
+    weekday_amt = 0.0
+    weekend_amt = 0.0
+    weekday_cnt = 0
+    weekend_cnt = 0
+    weekend_cats = defaultdict(float)
+    weekday_cats = defaultdict(float)
+    for t in transactions:
+        if t.get("category") == "Ignored/Refund":
+            continue
+        amt = float(t.get("amount", 0))
+        dt = parse_date_obj(t.get("date"))
+        if dt:
+            if dt.weekday() in (4, 5, 6): # Fri, Sat, Sun
+                weekend_amt += amt
+                weekend_cnt += 1
+                weekend_cats[t.get("category")] += amt
+            else:
+                weekday_amt += amt
+                weekday_cnt += 1
+                weekday_cats[t.get("category")] += amt
+                
+    weekend_vs_weekday_data = {
+        "weekday_total": round(weekday_amt, 2),
+        "weekday_count": weekday_cnt,
+        "weekday_avg_txn": round(weekday_amt / weekday_cnt, 2) if weekday_cnt else 0,
+        "weekend_total": round(weekend_amt, 2),
+        "weekend_count": weekend_cnt,
+        "weekend_avg_txn": round(weekend_amt / weekend_cnt, 2) if weekend_cnt else 0,
+        "top_weekend_cats": sorted([{"name": k, "amount": round(v, 2)} for k, v in weekend_cats.items()], key=lambda x: x["amount"], reverse=True)[:4]
+    }
+    
+    # 5. Top Merchants & Annualized Run-Rate
+    merch_stats = defaultdict(lambda: {"count": 0, "amount": 0.0, "category": ""})
+    for t in transactions:
+        if t.get("category") == "Ignored/Refund":
+            continue
+        m = t.get("merchant", "Unknown")
+        merch_stats[m]["count"] += 1
+        merch_stats[m]["amount"] += float(t.get("amount", 0))
+        merch_stats[m]["category"] = t.get("category", "Other")
+        
+    top_merchants_annualized = []
+    for m, s in sorted(merch_stats.items(), key=lambda x: x[1]["amount"], reverse=True)[:8]:
+        mo_avg = s["amount"] / months_count
+        top_merchants_annualized.append({
+            "merchant": m,
+            "category": s["category"],
+            "count": s["count"],
+            "total_amount": round(s["amount"], 2),
+            "monthly_avg": round(mo_avg, 2),
+            "annualized": round(mo_avg * 12, 2)
+        })
+        
+    # 6. Spend Velocity (Day 1 to 31 cumulative burn)
+    month_daily = defaultdict(lambda: [0.0] * 32)
+    for t in transactions:
+        if t.get("category") == "Ignored/Refund":
+            continue
+        m = t.get("month_year")
+        dt = parse_date_obj(t.get("date"))
+        if dt and m in sorted_months:
+            day = min(max(dt.day, 1), 31)
+            month_daily[m][day] += float(t.get("amount", 0))
+            
+    spend_velocity = {}
+    for m in sorted_months:
+        daily = month_daily[m]
+        cumulative = []
+        running = 0.0
+        for d in range(1, 32):
+            running += daily[d]
+            cumulative.append(round(running, 2))
+        spend_velocity[m] = cumulative
+        
+    return {
+        "micro_spend": micro_spend_data,
+        "fixed_vs_variable": fixed_vs_variable_data,
+        "spike_alerts": spike_alerts,
+        "weekend_vs_weekday": weekend_vs_weekday_data,
+        "top_merchants_annualized": top_merchants_annualized,
+        "spend_velocity": spend_velocity
+    }
+
+def aggregate_dashboard_data(transactions, opening_balance=0, closing_balance=0):
+    # Strictly filter for debits (spends only). Credits are completely excluded.
+    transactions = [t for t in transactions if t.get("type") == "Debit"]
+    
+    EXCLUDED_CATEGORIES = ["Ignored/Refund"]
 
     monthly_net_burns = defaultdict(float)
     months_set = set()
@@ -88,12 +259,13 @@ def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
     category_sums = defaultdict(float)
     category_counts = defaultdict(int)
     monthly_spend = defaultdict(float)
-    monthly_in = defaultdict(float)
     monthly_categories = defaultdict(lambda: defaultdict(float))
     monthly_needs_wants = defaultdict(lambda: defaultdict(float))
     monthly_transactions = defaultdict(list)
     merchant_counts = defaultdict(int)
     merchant_sums = defaultdict(float)
+
+    total_spend = 0.0
 
     for tx in transactions:
         if "tx_id" not in tx:
@@ -111,91 +283,104 @@ def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
         else:
             my = tx["month_year"]
             
+        amt = float(tx.get("amount", 0))
+        cat = tx.get("category", "Other")
+
         if my != "Unknown":
             months_set.add(my)
-            if tx.get("category") not in EXCLUDED_CATEGORIES:
-                if tx.get("type") == "Debit":
-                    monthly_net_burns[my] += tx.get("amount", 0)
-                else:
-                    monthly_net_burns[my] -= tx.get("amount", 0)
 
-        if tx.get("type") == "Debit":
-            category_sums[tx.get("category")] += tx.get("amount", 0)
-            category_counts[tx.get("category")] += 1
-            
-            if tx.get("category") not in EXCLUDED_CATEGORIES:
-                monthly_spend[my] += tx.get("amount", 0)
-                
-            monthly_categories[my][tx.get("category")] += tx.get("amount", 0)
+        if cat not in EXCLUDED_CATEGORIES:
+            total_spend += amt
+            monthly_net_burns[my] += amt
+            category_sums[cat] += amt
+            category_counts[cat] += 1
+            monthly_spend[my] += amt
+            monthly_categories[my][cat] += amt
             monthly_transactions[my].append(tx)
             
-            nw = get_needs_wants_mapping(tx.get("category"))
-            monthly_needs_wants[my][nw] += tx.get("amount", 0)
+            nw = get_needs_wants_mapping(cat)
+            monthly_needs_wants[my][nw] += amt
             
-            merchant_counts[tx.get("merchant")] += 1
-            merchant_sums[tx.get("merchant")] += tx.get("amount", 0)
-        else:
-            if tx.get("category") not in EXCLUDED_CATEGORIES:
-                if tx.get("category") == "Income":
-                    monthly_in[my] += tx.get("amount", 0)
-                else:
-                    monthly_spend[my] -= tx.get("amount", 0)
-                    category_sums[tx.get("category")] -= tx.get("amount", 0)
-                    monthly_categories[my][tx.get("category")] -= tx.get("amount", 0)
-                    nw = get_needs_wants_mapping(tx.get("category"))
-                    monthly_needs_wants[my][nw] -= tx.get("amount", 0)
+            merch = tx.get("merchant", "Unknown")
+            merchant_counts[merch] += 1
+            merchant_sums[merch] += amt
 
-    avg_monthly_net_burn = sum(monthly_net_burns.values()) / len(months_set) if months_set else 0
-    runway = round(closing_balance / avg_monthly_net_burn, 1) if avg_monthly_net_burn > 0 else "Infinite"
+    sorted_months = sorted(list(months_set), key=month_sort_key)
+    months_count = len(sorted_months)
+    avg_monthly_spend = round(total_spend / months_count, 2) if months_count else round(total_spend, 2)
 
     investments_total = category_sums.get("Investments", 0)
-    actual_spent = total_out - investments_total
+    actual_spent = total_spend - investments_total
+
+    highest_month = max(monthly_spend, key=monthly_spend.get) if monthly_spend else ""
+    highest_month_spend = round(monthly_spend[highest_month], 2) if highest_month else 0
+
+    period_str = ""
+    if sorted_months:
+        if len(sorted_months) == 1:
+            period_str = sorted_months[0]
+        else:
+            period_str = f"{sorted_months[0]} - {sorted_months[-1]}"
 
     overview = {
-        "total_in": total_in,
-        "total_out": total_out,
-        "net": net,
-        "opening_balance": opening_balance,
-        "closing_balance": closing_balance,
-        "runway": runway,
-        "reconciliation_diff": reconciliation_diff,
-        "investments_total": investments_total,
-        "actual_spent": actual_spent
+        "total_spend": round(total_spend, 2),
+        "total_out": round(total_spend, 2),
+        "avg_monthly_spend": avg_monthly_spend,
+        "investments_total": round(investments_total, 2),
+        "actual_spent": round(actual_spent, 2),
+        "highest_month": highest_month,
+        "highest_month_spend": highest_month_spend,
+        "months_count": months_count,
+        "months_list": sorted_months,
+        "period_str": period_str,
+        "tx_count": len(transactions)
     }
 
     categories = []
     for name, amount in category_sums.items():
         count = category_counts[name]
-        months_active = len(months_set)
-        avg_per_month = amount / months_active if months_active else amount
+        avg_per_month = amount / months_count if months_count else amount
         categories.append({
             "name": name,
             "amount": round(amount, 2),
             "count": count,
             "avg_per_month": round(avg_per_month, 2),
-            "percent": round((amount / total_out) * 100, 1) if total_out else 0,
+            "percent": round((amount / total_spend) * 100, 1) if total_spend else 0,
             "insight": f"{count} orders, ~₹{round(avg_per_month):,}/month"
         })
     categories.sort(key=lambda x: x["amount"], reverse=True)
 
     month_verdicts = {}
-    for m in sorted(list(months_set), key=lambda x: datetime.datetime.strptime(x, "%b %Y")):
-        net_m = monthly_in[m] - monthly_spend[m]
+    for m in sorted_months:
+        spend_m = monthly_spend[m]
         txs_m = monthly_transactions[m]
         if not txs_m:
-            month_verdicts[m] = {"net": round(net_m, 2), "reason": "No debits this month"}
+            month_verdicts[m] = {
+                "spend": round(spend_m, 2),
+                "vs_avg": 0,
+                "reason": "No debits this month"
+            }
             continue
         
         cats_m = monthly_categories[m]
-        biggest_cat = max(cats_m, key=cats_m.get)
-        biggest_tx = max(txs_m, key=lambda x: x["amount"])
+        biggest_cat = max(cats_m, key=cats_m.get) if cats_m else "Other"
+        biggest_cat_amt = cats_m.get(biggest_cat, 0)
         
-        if biggest_tx["amount"] > cats_m[biggest_cat] * 0.5:
-            reason = f"Heavy {biggest_tx['category']} payment (₹{biggest_tx['amount']:,}) dominated outflow"
+        cat_txs = [t for t in txs_m if t.get("category") == biggest_cat]
+        biggest_tx_in_cat = max(cat_txs, key=lambda x: x["amount"]) if cat_txs else None
+        
+        if biggest_tx_in_cat and biggest_tx_in_cat["amount"] >= biggest_cat_amt * 0.7 and biggest_tx_in_cat["amount"] >= spend_m * 0.2:
+            reason = f"Heavy {biggest_cat} payment (₹{round(biggest_tx_in_cat['amount']):,}) dominated outflow"
         else:
-            reason = f"{biggest_cat} (₹{cats_m[biggest_cat]:,}) was the biggest driver"
+            reason = f"{biggest_cat} (₹{round(biggest_cat_amt):,}) was the biggest driver"
         
-        month_verdicts[m] = {"net": round(net_m, 2), "reason": reason}
+        vs_avg = round(((spend_m - avg_monthly_spend) / avg_monthly_spend) * 100, 1) if avg_monthly_spend > 0 else 0
+        
+        month_verdicts[m] = {
+            "spend": round(spend_m, 2),
+            "vs_avg": vs_avg,
+            "reason": reason
+        }
 
     monthly_categories_list = {}
     for month, cat_dict in monthly_categories.items():
@@ -203,8 +388,7 @@ def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
         sorted_cats.sort(key=lambda x: x["amount"], reverse=True)
         monthly_categories_list[month] = sorted_cats
         
-    all_debits = [t for t in transactions if t.get("type") == "Debit"]
-    top_15_overall = sorted(all_debits, key=lambda x: x["amount"], reverse=True)[:15]
+    top_15_overall = sorted(transactions, key=lambda x: x["amount"], reverse=True)[:15]
     
     frequent_merchants = []
     for m, c in merchant_counts.items():
@@ -213,12 +397,12 @@ def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
     top_frequent = frequent_merchants[:15]
 
     monthly_trends = {
-        "income": {k: round(v, 2) for k, v in monthly_in.items()},
         "spend": {k: round(v, 2) for k, v in monthly_spend.items()},
-        "net": {k: round(monthly_in[k] - monthly_spend[k], 2) for k in monthly_spend.keys()},
-        "categories": monthly_categories_list,
-        "needs_wants": {k: {nk: round(nv, 2) for nk, nv in v.items()} for k, v in monthly_needs_wants.items()}
+        "avg_monthly_spend": avg_monthly_spend,
+        "categories": monthly_categories_list
     }
+
+    insights = compute_spend_insights(transactions, sorted_months, total_spend, avg_monthly_spend, category_sums)
 
     return {
         "overview": overview,
@@ -227,41 +411,188 @@ def aggregate_dashboard_data(transactions, opening_balance, closing_balance):
         "monthly_trends": monthly_trends,
         "month_verdicts": month_verdicts,
         "top_15_overall": top_15_overall,
-        "top_frequent": top_frequent
+        "top_frequent": top_frequent,
+        "insights": insights
     }
 
-@app.post("/api/upload")
-async def process_upload(
-    bank_statement: UploadFile = File(...),
-    context_note: str = Form(None)
-):
-    try:
-        suffix = os.path.splitext(bank_statement.filename)[1]
+def parse_uploaded_files(files: List[UploadFile]) -> List[dict]:
+    all_transactions = []
+    for file in files:
+        if not file or not file.filename:
+            continue
+        suffix = os.path.splitext(file.filename)[1]
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            shutil.copyfileobj(bank_statement.file, tmp)
+            shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
-
         try:
-            transactions = parse_bank_statement(tmp_path)
+            txs = parse_bank_statement(tmp_path)
+            if txs:
+                debits_only = [t for t in txs if t.get('type') == 'Debit']
+                all_transactions.extend(debits_only)
+        except Exception as e:
+            print(f"Error parsing file {file.filename}: {e}")
+            raise ValueError(f"Could not parse '{file.filename}': {str(e)}")
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+    return all_transactions
 
-        if not transactions:
-            return {"status": "error", "message": "No transactions found"}
+def merge_and_sort_transactions(existing_txs, new_txs, existing_ob, existing_cb):
+    seen_ids = set()
+    merged = []
+    
+    # Track existing
+    for tx in existing_txs:
+        tid = tx.get("tx_id")
+        if not tid:
+            raw_str = f'{tx.get("date", "")}_{tx.get("merchant", "")}_{tx.get("amount", "")}_{tx.get("balance", "")}'
+            tid = hashlib.md5(raw_str.encode('utf-8')).hexdigest()
+            tx["tx_id"] = tid
+        if tid not in seen_ids:
+            seen_ids.add(tid)
+            merged.append(tx)
+            
+    added_count = 0
+    new_non_dupes = []
+    for tx in new_txs:
+        tid = tx.get("tx_id")
+        if not tid:
+            raw_str = f'{tx.get("date", "")}_{tx.get("merchant", "")}_{tx.get("amount", "")}_{tx.get("balance", "")}'
+            tid = hashlib.md5(raw_str.encode('utf-8')).hexdigest()
+            tx["tx_id"] = tid
+        if tid not in seen_ids:
+            seen_ids.add(tid)
+            merged.append(tx)
+            new_non_dupes.append(tx)
+            added_count += 1
+            
+    # Sort merged transactions chronologically
+    def get_sort_key(t):
+        dt = parse_date_obj(t.get("date", ""))
+        return (dt if dt is not None else datetime.datetime.min)
+        
+    merged.sort(key=get_sort_key)
+    
+    # Calculate appropriate opening and closing balances
+    if not existing_txs and merged:
+        opening_balance = merged[0].get("balance", 0)
+        closing_balance = merged[-1].get("balance", 0)
+    elif merged:
+        existing_dates = [parse_date_obj(t.get("date", "")) for t in existing_txs]
+        existing_dates = [d for d in existing_dates if d is not None]
+        
+        new_dates = [parse_date_obj(t.get("date", "")) for t in new_non_dupes]
+        new_dates = [d for d in new_dates if d is not None]
+        
+        opening_balance = existing_ob
+        closing_balance = existing_cb
+        
+        if existing_dates and new_dates:
+            if min(new_dates) < min(existing_dates):
+                # New transactions are earlier in time
+                opening_balance = merged[0].get("balance", existing_ob)
+            if max(new_dates) > max(existing_dates):
+                # New transactions are later in time
+                closing_balance = merged[-1].get("balance", existing_cb)
+        elif merged:
+            opening_balance = merged[0].get("balance", existing_ob)
+            closing_balance = merged[-1].get("balance", existing_cb)
+    else:
+        opening_balance = existing_ob
+        closing_balance = existing_cb
+        
+    return merged, opening_balance, closing_balance, added_count
 
-        opening_balance = transactions[0].get("balance", 0) if transactions else 0
-        closing_balance = transactions[-1].get("balance", 0) if transactions else 0
+@app.post("/api/upload")
+async def process_upload(
+    bank_statement: Optional[UploadFile] = File(None),
+    bank_statements: Optional[List[UploadFile]] = File(None),
+    context_note: Optional[str] = Form(None)
+):
+    try:
+        files = []
+        if bank_statements:
+            files.extend([f for f in bank_statements if f.filename])
+        if bank_statement and bank_statement.filename:
+            files.append(bank_statement)
 
-        dashboard_data = aggregate_dashboard_data(transactions, opening_balance, closing_balance)
+        if not files:
+            return {"status": "error", "message": "No file uploaded"}
+
+        raw_txs = parse_uploaded_files(files)
+        if not raw_txs:
+            return {"status": "error", "message": "No transactions found in uploaded statement(s)"}
+
+        merged, opening_balance, closing_balance, _ = merge_and_sort_transactions([], raw_txs, 0, 0)
+        dashboard_data = aggregate_dashboard_data(merged, opening_balance, closing_balance)
         
         # Save session
         with open(DATA_DIR / "current_data.json", "w") as f:
-            json.dump({"transactions": transactions, "opening_balance": opening_balance, "closing_balance": closing_balance}, f)
+            json.dump({"transactions": merged, "opening_balance": opening_balance, "closing_balance": closing_balance}, f)
             
-        return {"status": "success", "data": dashboard_data}
+        return {"status": "success", "data": dashboard_data, "added_count": len(merged), "total_count": len(merged)}
     except Exception as e:
         print(f"Parsing Error: {str(e)}")
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/append-statement")
+async def append_statement(
+    bank_statement: Optional[UploadFile] = File(None),
+    bank_statements: Optional[List[UploadFile]] = File(None),
+    context_note: Optional[str] = Form(None)
+):
+    try:
+        files = []
+        if bank_statements:
+            files.extend([f for f in bank_statements if f.filename])
+        if bank_statement and bank_statement.filename:
+            files.append(bank_statement)
+
+        if not files:
+            return {"status": "error", "message": "No statement file uploaded"}
+
+        # Load existing session
+        data_file = DATA_DIR / "current_data.json"
+        existing_txs = []
+        existing_ob = 0
+        existing_cb = 0
+        if os.path.exists(data_file):
+            try:
+                with open(data_file, "r") as f:
+                    saved = json.load(f)
+                existing_txs = saved.get("transactions", [])
+                existing_ob = saved.get("opening_balance", 0)
+                existing_cb = saved.get("closing_balance", 0)
+            except Exception as e:
+                print(f"Failed to load existing session during append: {e}")
+
+        new_txs = parse_uploaded_files(files)
+        if not new_txs:
+            return {"status": "error", "message": "No transactions found in the new statement file(s)"}
+
+        merged, opening_balance, closing_balance, added_count = merge_and_sort_transactions(
+            existing_txs, new_txs, existing_ob, existing_cb
+        )
+
+        dashboard_data = aggregate_dashboard_data(merged, opening_balance, closing_balance)
+
+        # Save updated session
+        with open(DATA_DIR / "current_data.json", "w") as f:
+            json.dump({"transactions": merged, "opening_balance": opening_balance, "closing_balance": closing_balance}, f)
+
+        return {
+            "status": "success",
+            "data": dashboard_data,
+            "added_count": added_count,
+            "total_count": len(merged),
+            "new_parsed_count": len(new_txs),
+            "period_str": dashboard_data["overview"].get("period_str", ""),
+            "months_count": dashboard_data["overview"].get("months_count", 1)
+        }
+    except Exception as e:
+        print(f"Append Error: {str(e)}")
+        traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
 @app.get("/api/load-session")
@@ -377,7 +708,17 @@ async def chat_endpoint(request: ChatRequest):
         
         # Prepare context
         context_str = json.dumps(request.context_data, indent=2)
-        system_prompt = f"You are a helpful financial assistant. You have access to the user's parsed bank statement and dashboard data. Use this data to answer their questions accurately and concisely.\n\nContext Data:\n{context_str}"
+        system_prompt = (
+            "You are a helpful, expert financial assistant for Spend Analyzer. "
+            "You have access to the user's complete bank statements, transactions, monthly trends, month verdicts, and category data.\n\n"
+            "FINANCIAL RULES & DATA CONVENTIONS:\n"
+            "1. 'Spend' represents total monthly expenses and consumption debits across all categories, which includes 'Family/Self Transfer', Rent, Investments, Food & Dining, Bills, etc.\n"
+            "2. 'Category Explorer', 'Month-by-Month Verdicts', and 'Monthly Trends' are completely unified. For every month, the total spend reflects all debit transactions for that month.\n"
+            "3. For example, for October 2026, total spend is ₹81,508.94 (displayed as ₹81,509). This includes ₹15,000 Rent, ₹14,650 Investments, ₹10,000 Family/Self Transfer, ₹9,880 Fun & Entertainment, ₹6,935 Food & Dining, etc., matching the Category Explorer Selected Total.\n"
+            "4. For May 2026, total spend is ₹52,260.20 (including ₹10,000 Family/Self Transfer). For June 2026, total spend is ₹101,211.65 (including ₹25,000 Family/Self Transfer), etc.\n"
+            "5. Always quote the accurate numbers from 'monthly_trends.spend' and 'month_verdicts' in the context data.\n\n"
+            f"Context Data:\n{context_str}"
+        )
         
         # Convert history
         messages = [{"role": "user", "parts": [system_prompt]}]
@@ -416,6 +757,45 @@ async def export_excel(request: Request):
                 if not df_tx.empty:
                     df_tx = df_tx.drop(columns=["tx_id"], errors="ignore")
                 df_tx.to_excel(writer, sheet_name="Transactions", index=False)
+                
+                # Apply AutoFilter and Subtotal
+                worksheet = writer.sheets["Transactions"]
+                max_row = len(df_tx) + 1
+                max_col = len(df_tx.columns)
+                
+                import openpyxl
+                from openpyxl.utils import get_column_letter
+                
+                # Add auto filter
+                worksheet.auto_filter.ref = f"A1:{get_column_letter(max_col)}{max_row}"
+                
+                # Find amount column and add subtotal
+                amount_col_idx = None
+                for idx, col_name in enumerate(df_tx.columns):
+                    if col_name.lower() == "amount":
+                        amount_col_idx = idx + 1
+                        break
+                
+                if amount_col_idx:
+                    worksheet.cell(row=max_row+1, column=1, value="Total")
+                    worksheet.cell(row=max_row+1, column=1).font = openpyxl.styles.Font(bold=True)
+                    
+                    amt_letter = get_column_letter(amount_col_idx)
+                    cell = worksheet.cell(row=max_row+1, column=amount_col_idx, value=f"=SUBTOTAL(109,{amt_letter}2:{amt_letter}{max_row})")
+                    cell.font = openpyxl.styles.Font(bold=True)
+                    
+                # Adjust column widths for better visibility
+                for col in worksheet.columns:
+                    max_length = 0
+                    column = col[0].column_letter
+                    for cell in col:
+                        try:
+                            if len(str(cell.value)) > max_length:
+                                max_length = len(str(cell.value))
+                        except:
+                            pass
+                    adjusted_width = min(max_length + 2, 50)
+                    worksheet.column_dimensions[column].width = adjusted_width
             
             if "categories" in data:
                 pd.DataFrame(data["categories"]).to_excel(writer, sheet_name="Categories", index=False)

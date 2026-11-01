@@ -14,14 +14,14 @@ if not exist "venv\Scripts\activate.bat" (
 )
 
 :: Start the FastAPI server in a new window so it runs in the background
-start "Spend Analyzer Server" cmd /k "venv\Scripts\activate.bat && uvicorn app.main:app --port 8000"
+start "Spend Analyzer Server" cmd /k "venv\Scripts\activate.bat && uvicorn app.main:app --port 8501"
 
 :: Wait for 3 seconds to give the server time to boot up
 timeout /t 3 /nobreak > nul
 
 :: Open the default web browser to the local dashboard
 echo Opening dashboard in your web browser...
-start http://127.0.0.1:8000
+start http://127.0.0.1:8501
 
 echo.
 echo =========================================
